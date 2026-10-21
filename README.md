@@ -1,8 +1,8 @@
 # AROI — African Research Opportunity Intelligence
 
-Finds new South African agricultural research every day, works out which findings could become a
-business, checks them against the real market with live web search, scores them, and emails you the
-best few each Monday.
+Finds new South African research every day across five sectors, works out which findings could become
+a business, checks them against the real market with live web search, scores them, and emails you the
+best few per sector each Monday.
 
 ```
 OpenAlex ──► 1 Discover ──► 2 Triage ──► 3 Analyse ──► 4 Generate ──► 5 Validate ──► 6 Score ──► Digest
@@ -13,7 +13,26 @@ OpenAlex ──► 1 Discover ──► 2 Triage ──► 3 Analyse ──► 4
                          all stages read/write one Supabase Postgres database
 ```
 
-Pilot scope: South Africa · agriculture & food · lean budget (default hard cap $20/month).
+Scope: South Africa · default hard cap $45/month on Claude spend.
+
+| Sector | What it sweeps (OpenAlex, SA-affiliated authors) | Output |
+|---|---|---|
+| Agriculture & food | field 11 Agricultural & Biological Sciences | business opportunities |
+| Renewable energy & storage | field 21 Energy | business opportunities |
+| AI & data products | subfields 1702 AI, 1707 Computer Vision | business opportunities |
+| Real estate, construction & materials | subfields 2205 Civil Eng., 2215 Building & Construction, 3322 Urban Studies | business opportunities |
+| Quant finance & options | subfield 2003 Finance | **testable hypotheses only** — never trading signals |
+
+Each sector also runs 5–12 keyword searches across Southern/East Africa (or the whole continent for
+African-language AI, proptech and finance), and has its own screening guide, readiness scale and
+South African market/regulatory notes (e.g. NERSA and NRS 097 for energy, POPIA for AI, Agrément SA
+and SANS 10400 for building systems). All of it lives in `aroi/sectors.py`.
+
+**The quant finance track is research-only, by design.** It reads finance papers, extracts the claimed
+edge (signal, instruments, data, whether it was tested out-of-sample with costs), lists red flags such
+as look-ahead or survivorship bias, and ranks hypotheses by *testability*, not profit. It stops there.
+Backtesting needs historical option data (paid for JSE) and a proper testing harness, which is a
+separate project to build once a hypothesis earns it.
 
 ---
 
@@ -35,6 +54,8 @@ things that were outdated or would have caused problems:
 | IP: "who owns it?" | IPR-PFRD Act pathway generated per opportunity | SA universities own most publicly funded IP; the route is a licence via the tech transfer office. |
 | Crossref enrichment | Dropped for v1 | OpenAlex already ingests Crossref; it added calls without new information. |
 | Full text | GROBID full text from OpenAlex ($0.01/paper) for analysed papers only | Better evidence quotes for a cent; abstracts used otherwise. |
+| Five independent agents | One pipeline, sector-specific prompts and context, per-sector daily quotas, sector order rotated daily | Same quality bar everywhere; no sector starves another when the run budget is hit. |
+| Options agent finds "edges" | Separate hypothesis track scored on testability | A paper's significant result is not evidence of a tradable edge. |
 | Supabase table view | Plus RLS on all tables, an `opportunity_board` view, and a phone-friendly "Record a decision" workflow | Supabase exposes `public` via its REST API; RLS blocks the anon key. |
 
 ---
@@ -69,12 +90,13 @@ Repository → Settings → Secrets and variables → Actions → New repository
 | `ANTHROPIC_API_KEY` | from step 1 |
 | `SMTP_USER`, `SMTP_PASSWORD`, `DIGEST_TO` | your Gmail address, the app password, where to send the digest |
 
-Optional: under **Variables**, set `MONTHLY_BUDGET_USD` (default 20).
+Optional, under **Variables**: `MONTHLY_BUDGET_USD` (default 45), `SECTORS` (default all five),
+`ANALYZE_PER_SECTOR` (default 2), `VALIDATE_PER_SECTOR` (default 1).
 
 ### 5. First run
-Actions → **Daily research pipeline** → Run workflow. The first run looks back 90 days, so it
-finds a backlog (often 1,000+ papers); triage clears up to 300 a day, so the queue settles within
-a week. Then Actions → **Weekly digest** → Run workflow to get your first email.
+Actions → **Daily research pipeline** → Run workflow. The first run looks back 90 days across all
+five sectors, so it finds a backlog (often a few thousand papers); triage clears up to 150 per sector
+per day, so the queue settles within a week or two. Then Actions → **Weekly digest** → Run workflow to get your first email.
 
 From then on it runs by itself: pipeline daily at 05:17, digest Mondays at 06:41 (SA time).
 
@@ -87,7 +109,8 @@ the next action, the cheapest test that could kill the idea, the IP route, the s
 the market pages the agent actually read.
 
 **Record decisions — this is what makes it improve.** From your phone: GitHub app → Actions →
-**Record a decision** → enter the 8-character id from the digest, pick `promising`/`rejected`/…,
+**Record a decision** → enter the 8-character id from the digest (works for opportunities and
+finance hypotheses), pick `promising`/`rejected`/…,
 and say why. Or on a laptop: `python -m aroi review 6c8f9b1c rejected "PICS bags already cheaper"`.
 Your decisions appear in the next digest and build the dataset you'll calibrate the scoring on.
 
@@ -97,31 +120,38 @@ Your decisions appear in the next digest and build the dataset you'll calibrate 
 **Local commands** (with a `.env` copied from `.env.example`):
 ```
 python -m aroi status            # counts and month-to-date spend
-python -m aroi list --min-score 55
+python -m aroi list --min-score 55 --sector energy
 python -m aroi daily --only discover triage
+SECTORS=ai,construction python -m aroi daily   # run just some sectors
 python -m aroi digest --no-email # writes out/digest-*.html
 ```
 
-**Edit what it searches:** the `search_queries` table (add rows, or set `active=false`).
-To widen the sweep, set `SWEEP_FIELDS=11|23` (adds Environmental Science).
+**Edit what it searches:** the `search_queries` table (add rows with the right `sector`, or set
+`active=false`). Don't use `*` wildcards — OpenAlex rejects them; a bad query is skipped and logged.
+To change a sweep, edit `sweep_filter` for that sector in `aroi/sectors.py`.
+**Turn sectors off:** set the `SECTORS` variable, e.g. `agriculture,energy`.
 
 ---
 
 ## What it costs
 
+Default quotas per day: triage up to 150 papers per sector, full analysis of the top **2 per sector**,
+market validation of **1 opportunity per sector**.
+
 | Item | Typical month |
 |---|---|
-| OpenAlex (sweep + 12 searches/day + ~5 full texts/day) | $0 — inside the free $1/day |
-| Triage, Haiku 5.5 (~20–60 papers/day) | under $0.20 |
-| Analysis + idea generation, Sonnet 5.5 (≤5 papers/day) | $3–6 |
-| Market validation incl. web search at $10/1,000 (≤2/day) | $4–9 |
-| Scoring, Sonnet 5.5 | about $1 |
+| OpenAlex (5 sweeps + 37 searches/day + a few full texts) | $0 — inside the free $1/day |
+| Triage, Haiku 5.5 | under $1 |
+| Analysis + idea generation, Sonnet 5.5 (≈10 papers/day) | $12–20 |
+| Market validation incl. web search at $10/1,000 (≈4/day) | $12–18 |
+| Scoring, Sonnet 5.5 | $2–3 |
 | Supabase free tier, GitHub Actions | $0 |
-| **Total** | **≈ $8–16**, hard-capped by `MONTHLY_BUDGET_USD` |
+| **Total** | **≈ $26–42**, hard-capped by `MONTHLY_BUDGET_USD` (45) |
 
 Estimates from Oct 2026 list prices; check `agent_runs` for your real cost per paper after week one.
-The guard stops all model calls once the month's logged spend reaches the cap, and each run stops at
-`RUN_BUDGET_USD`. Supabase's free tier pauses after 7 days of inactivity; the daily run prevents that.
+To spend less, lower the cap — the run stops when it's reached, and sectors take turns going first —
+or set `ANALYZE_PER_SECTOR=1`, or turn sectors off. Supabase's free tier pauses after 7 days of
+inactivity; the daily run prevents that.
 
 ---
 
@@ -144,31 +174,33 @@ an opportunity.
 ## Project layout
 ```
 sql/schema.sql            tables, indexes, RLS, opportunity_board view (idempotent)
-sql/seed.sql              12 starter keyword searches from the blueprint's taxonomy
+sql/seed.sql              37 starter keyword searches across the five sectors
+aroi/sectors.py           sector registry: sweep filters, screening guides, SA market context
 aroi/openalex.py          API client: cursor paging, retries, budget errors, GROBID full text
 aroi/normalize.py         abstract rebuild, DOI/title dedup keys, TEI parsing, quote verification
 aroi/llm.py               structured-output and web-search calls, cost log, budget guard
-aroi/prompts.py           all agent prompts + SA country context (versioned)
+aroi/prompts.py           all agent prompts incl. the finance analyst (versioned)
 aroi/schemas.py           JSON schemas for every agent's output
-aroi/scoring.py           weights, total score, evidence-grade cap, recommended action
-aroi/stages/              discover · triage · analyze · opportunities · validate · score
+aroi/scoring.py           weights, total score, evidence-grade cap, finance testability score
+aroi/stages/              discover · triage · analyze (+finance) · opportunities · validate · score
 aroi/digest.py            weekly HTML email
 .github/workflows/        daily pipeline · weekly digest · record a decision · tests
-tests/                    20 tests; the pipeline test runs every stage against real Postgres
+tests/                    29 tests; the pipeline test runs every stage for every sector against real Postgres
 ```
 
 Run tests: `TEST_DATABASE_URL=postgresql://… pytest` (uses a throwaway database — it drops the schema).
 
 ## Troubleshooting
-- **Discover stage: OpenAlex 400** — the filter syntax changed. Try the sweep URL from the log in a
-  browser with your key; the `primary_topic.field.id` and `type` filters are the likely culprits.
+- **Discover stage: OpenAlex 400** — a sweep or query was rejected. The log names the sector and query;
+  try that URL in a browser with your key. One failing sector or query doesn't stop the others.
 - **429 "budget"** — OpenAlex daily allowance used; it resets at 02:00 SA time. Lower `MAX_SWEEP_PAGES`.
 - **"Monthly budget reached"** — working as designed; raise `MONTHLY_BUDGET_USD` or wait for the 1st.
 - **Opportunity stuck at `failed`** — set `pipeline_status` back to `generated` in the table editor to retry.
 - **No email** — check the three SMTP secrets; the digest is always saved as a workflow artifact too.
 
 ## Expanding later
-Countries: add a `COUNTRY_CONTEXT` entry in `prompts.py`, set `TARGET_COUNTRY`, and run a second
-scheduled job. Sectors: add `search_queries` rows with a new `sector`, set `SECTOR` and the matching
-`SWEEP_FIELDS` (e.g. 21 Energy, 22 Engineering, 17 Computer Science). Keep the options-trading idea
-a separate project: it needs backtesting infrastructure, not this pipeline.
+**New sector:** add a `Sector(...)` entry in `aroi/sectors.py` (sweep filter, categories, signal guide,
+SA context) and keyword rows in `sql/seed.sql`; add its key to `SECTORS`. **New country:** add a
+`COUNTRY_CONTEXT` entry in `prompts.py` and a `context` entry for that country in each sector, then
+run a second scheduled job with `TARGET_COUNTRY` set. **Backtesting:** once a finance hypothesis is
+worth it, build that as its own project with proper data, out-of-sample splits, costs and paper trading.

@@ -20,6 +20,16 @@ ABSTRACTS = {
         "Hermetic bags reduced weevil damage by 85% compared with polypropylene sacks after 24 weeks. "
         "Adoption was limited by availability in local retail stores."
     ),
+    "battery": (
+        "We assessed second-life electric vehicle batteries as backup storage for small retailers in Gauteng. "
+        "Repurposed modules retained 78% of rated capacity after 1,200 cycles in a 9-month field deployment. "
+        "System cost was 41% lower than new lithium iron phosphate packs of equal usable capacity."
+    ),
+    "volatility": (
+        "We forecast JSE Top 40 implied volatility using heterogeneous autoregressive models with option-implied inputs. "
+        "Out-of-sample forecasts reduced mean squared error by 14% relative to GARCH over 2015-2024. "
+        "A delta-hedged straddle strategy remained profitable after transaction costs of 2 volatility points."
+    ),
     "policy": (
         "This study reviews agricultural policy discourse in South African provincial departments between 1994 "
         "and 2020 using qualitative content analysis of 230 policy documents and stakeholder interviews. "
@@ -80,6 +90,10 @@ SWEEP = [
     make_work("W2", "Agricultural policy discourse in provincial departments", abstract_key="policy", grobid=False),
     make_work("W3", "A short note", abstract_key=None, grobid=False),  # no abstract -> skipped
 ]
+ENERGY = [make_work("E1", "Second-life EV batteries as backup storage for small businesses during load-shedding",
+                    abstract_key="battery", inst="University of Johannesburg", grobid=False)]
+FINANCE = [make_work("Q1", "Forecasting JSE Top 40 implied volatility with HAR models", abstract_key="volatility",
+                     inst="University of Cape Town", grobid=False)]
 KEYWORD = [
     # same paper as W1 under a different OpenAlex id but same DOI (upper case) -> must dedupe
     make_work("W99", "Hermetic recycled-polyethylene bags cut smallholder maize storage losses", doi="https://doi.org/10.1/HERMETIC"),
@@ -99,7 +113,20 @@ def openalex_transport(calls: list):
         if url.netloc == "content.openalex.org":
             return httpx.Response(200, text=GROBID)
         q = parse_qs(url.query)
-        results = KEYWORD if "search" in q else SWEEP
+        flt = q.get("filter", [""])[0]
+        search = q.get("search", [""])[0]
+        if search:
+            if "TinyML" in search:  # simulate a query OpenAlex rejects
+                return httpx.Response(400, json={"error": "Invalid query"})
+            results = KEYWORD if "hermetic" in search else []
+        elif "primary_topic.field.id:11" in flt:
+            results = SWEEP
+        elif "primary_topic.field.id:21" in flt:
+            results = ENERGY
+        elif "primary_topic.subfield.id:2003" in flt:
+            results = FINANCE
+        else:
+            results = []
         return httpx.Response(
             200, json={"meta": {"count": len(results), "next_cursor": None, "cost_usd": 0.0001}, "results": results}
         )
@@ -134,12 +161,13 @@ class FakeMessages:
         user = kw["messages"][0]["content"]
         if "results" in props:
             out = {"results": []}
+            enum = props["results"]["items"]["properties"]["category"]["enum"]
             for ref, title in re.findall(r'<paper ref="(P\d+)">\nTitle: ([^\n]+)', user):
-                maize = "maize" in title.lower()
+                hit = any(w in title.lower() for w in ("maize", "batteries", "volatility"))
                 out["results"].append({
-                    "ref": ref, "commercial_signal": 8 if maize else 2,
-                    "sector": "food_processing_and_preservation" if maize else "not_relevant",
-                    "reason": "measured storage result" if maize else "policy analysis",
+                    "ref": ref, "commercial_signal": 8 if hit else 2,
+                    "category": enum[0] if hit else "not_relevant",
+                    "reason": "measured result" if hit else "policy analysis",
                 })
         elif "problem" in props:
             m = re.search(r"<abstract>\n(.*?)\n</abstract>", user, re.S)
@@ -156,6 +184,30 @@ class FakeMessages:
                 "readiness_evidence": ["field trial"], "applications_to_investigate": ["storage bags"],
                 "missing_information": ["unit cost at scale"], "evidence_confidence": 0.7,
             }
+        elif "hypothesis" in props:
+            m = re.search(r"<abstract>\n(.*?)\n</abstract>", user, re.S)
+            sentences = [s.strip() for s in m.group(1).split(". ") if s.strip()]
+            out = {
+                "hypothesis": "HAR models with option-implied inputs forecast JSE Top 40 implied volatility better than GARCH",
+                "signal_definition": "HAR regression on daily, weekly, monthly realised and implied vol",
+                "instruments_and_market": "JSE Top 40 index options", "data_period": "2015-2024",
+                "data_needed": ["Top 40 option chains", "index prices"],
+                "out_of_sample_tested": True, "transaction_costs_modelled": True, "liquidity_considered": False,
+                "reported_performance": "14% lower MSE out of sample",
+                "findings": [{"claim": "Lower forecast error", "evidence_quote": sentences[1], "location": "abstract",
+                              "measured_or_inferred": "measured", "limitations": ["single index"]}],
+                "red_flags": ["single market regime"], "replication_difficulty": "moderate", "evidence_confidence": 0.6,
+            }
+        elif "opportunities" in props and "batteries" in user:
+            out = {"opportunities": [
+                {"title": "Second-life battery backup packs for spaza shops",
+                 "customer_problem": "Stock spoilage and lost sales during outages", "target_customer": "Township retailers",
+                 "proposed_solution": "Refurbished EV-module backup pack", "revenue_model": "Rent-to-own",
+                 "enabling_finding_refs": ["F1"], "why_existing_solutions_fall_short": "New LFP packs too expensive",
+                 "delivery_requirements": ["module testing rig"], "commercial_assumptions": ["Shops pay R400/month"],
+                 "key_risks": ["Battery safety certification"], "cheapest_disproving_experiment": "Offer 10 shops a 3-month trial",
+                 "confidence": 0.6},
+            ]}
         elif "opportunities" in props:
             out = {"opportunities": [
                 {"title": "Hermetic maize storage bags for smallholder farmers",

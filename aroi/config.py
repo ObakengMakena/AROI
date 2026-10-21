@@ -39,10 +39,12 @@ class Config:
 
     # --- scope -------------------------------------------------------------
     country: str = field(default_factory=lambda: os.getenv("TARGET_COUNTRY", "ZA"))
-    sector: str = field(default_factory=lambda: os.getenv("SECTOR", "agriculture"))
-    # OpenAlex field ids for the sweep. 11 = Agricultural and Biological Sciences
-    # (includes Food Science, Soil Science, Agronomy, Animal Science, Horticulture...).
-    sweep_fields: str = field(default_factory=lambda: os.getenv("SWEEP_FIELDS", "11"))
+    # Comma-separated sector keys from aroi/sectors.py. All five run by default.
+    sectors: list[str] = field(
+        default_factory=lambda: [
+            x.strip() for x in (os.getenv("SECTORS") or "agriculture,energy,ai,construction,quant_finance").split(",") if x.strip()
+        ]
+    )
     sweep_work_types: str = field(
         default_factory=lambda: os.getenv("SWEEP_WORK_TYPES", "article|preprint|dissertation|report|book-chapter")
     )
@@ -60,24 +62,24 @@ class Config:
 
     # --- throughput & thresholds ----------------------------------------------
     triage_batch_size: int = field(default_factory=lambda: _int("TRIAGE_BATCH_SIZE", 10))
-    triage_max_per_run: int = field(default_factory=lambda: _int("TRIAGE_MAX_PER_RUN", 300))
+    triage_max_per_sector: int = field(default_factory=lambda: _int("TRIAGE_MAX_PER_SECTOR", 150))
     triage_threshold: int = field(default_factory=lambda: _int("TRIAGE_THRESHOLD", 6))  # 0-10
-    analyze_per_run: int = field(default_factory=lambda: _int("ANALYZE_PER_RUN", 5))
+    analyze_per_sector: int = field(default_factory=lambda: _int("ANALYZE_PER_SECTOR", 2))
     use_full_text: bool = field(default_factory=lambda: _bool("USE_FULL_TEXT", True))
     full_text_max_chars: int = field(default_factory=lambda: _int("FULL_TEXT_MAX_CHARS", 45000))
     min_evidence_for_opportunities: float = field(default_factory=lambda: _float("MIN_EVIDENCE_FOR_OPPS", 0.35))
-    validate_per_run: int = field(default_factory=lambda: _int("VALIDATE_PER_RUN", 2))
+    validate_per_sector: int = field(default_factory=lambda: _int("VALIDATE_PER_SECTOR", 1))
     web_searches_per_validation: int = field(default_factory=lambda: _int("WEB_SEARCHES_PER_VALIDATION", 6))
     score_per_run: int = field(default_factory=lambda: _int("SCORE_PER_RUN", 10))
     merge_similarity: float = field(default_factory=lambda: _float("MERGE_SIMILARITY", 0.55))
 
     # --- budget guard (USD) -------------------------------------------------
-    monthly_budget_usd: float = field(default_factory=lambda: _float("MONTHLY_BUDGET_USD", 20.0))
-    run_budget_usd: float = field(default_factory=lambda: _float("RUN_BUDGET_USD", 2.0))
+    monthly_budget_usd: float = field(default_factory=lambda: _float("MONTHLY_BUDGET_USD", 45.0))
+    run_budget_usd: float = field(default_factory=lambda: _float("RUN_BUDGET_USD", 3.0))
 
     # --- digest ---------------------------------------------------------------
     digest_min_score: float = field(default_factory=lambda: _float("DIGEST_MIN_SCORE", 55.0))
-    digest_top_n: int = field(default_factory=lambda: _int("DIGEST_TOP_N", 5))
+    digest_top_n_per_sector: int = field(default_factory=lambda: _int("DIGEST_TOP_N_PER_SECTOR", 3))
     digest_to: str = field(default_factory=lambda: os.getenv("DIGEST_TO", ""))
     smtp_host: str = field(default_factory=lambda: os.getenv("SMTP_HOST", "smtp.gmail.com"))
     smtp_port: int = field(default_factory=lambda: _int("SMTP_PORT", 465))

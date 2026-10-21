@@ -110,10 +110,15 @@ class OpenAlexClient:
                 params["select"] = SELECT_FIELDS
             r = self._get(f"{BASE}/works", params)
             if r.status_code == 400 and self.use_select:
-                log.warning("OpenAlex rejected the select list; retrying with full records.")
-                self.use_select = False
-                params.pop("select", None)
-                continue
+                # maybe a field in `select` was renamed; retry once without it
+                retry = dict(params)
+                retry.pop("select", None)
+                r2 = self._get(f"{BASE}/works", retry)
+                if r2.status_code == 200:
+                    log.warning("OpenAlex rejected the select list; using full records from now on.")
+                    self.use_select = False
+                    params.pop("select", None)
+                r = r2
             if r.status_code != 200:
                 raise OpenAlexError(f"OpenAlex {r.status_code}: {r.text[:400]}")
             data = r.json()

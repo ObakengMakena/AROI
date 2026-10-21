@@ -69,7 +69,8 @@ create table if not exists papers (
   countries text[] not null default '{}',
   authors jsonb not null default '[]'::jsonb,
   cited_by_count integer,
-  found_by text[] not null default '{}',        -- 'sweep', or the query text that found it
+  sector text,                                   -- sector whose search found it first
+  found_by text[] not null default '{}',        -- 'sweep:<sector>', or the query that found it
   status text not null default 'new'
     check (status in ('new', 'triaged_out', 'queued', 'analyzing', 'analyzed', 'failed')),
   triage_score smallint,
@@ -81,9 +82,15 @@ create table if not exists papers (
   analyzed_at timestamptz,
   opportunities_generated_at timestamptz
 );
+-- upgrades for databases created by v1 (no-ops on a fresh install)
+alter table papers add column if not exists opportunities_generated_at timestamptz;
+alter table papers add column if not exists sector text;
+update papers set sector = 'agriculture' where sector is null;
+
 create unique index if not exists papers_title_fp_year_idx
   on papers (title_fingerprint, (extract(year from publication_date)));
 create index if not exists papers_status_idx on papers (status, triage_score desc);
+create index if not exists papers_sector_status_idx on papers (sector, status);
 create index if not exists papers_publication_date_idx on papers (publication_date desc);
 
 create table if not exists paper_institutions (
@@ -210,16 +217,49 @@ create table if not exists opportunity_scores (
 );
 
 -- ---------------------------------------------------------------------------
+-- Quant finance track: research hypotheses to (maybe) backtest. Never trading signals.
+-- ---------------------------------------------------------------------------
+create table if not exists finance_hypotheses (
+  id uuid primary key default gen_random_uuid(),
+  paper_id uuid not null references papers(id) on delete cascade,
+  analysis_id uuid references paper_analyses(id) on delete cascade,
+  hypothesis text not null,
+  signal_definition text,
+  instruments_and_market text,
+  data_period text,
+  data_needed jsonb not null default '[]'::jsonb,
+  out_of_sample_tested boolean not null default false,
+  transaction_costs_modelled boolean not null default false,
+  liquidity_considered boolean not null default false,
+  reported_performance text,
+  red_flags jsonb not null default '[]'::jsonb,
+  replication_difficulty text,
+  testability_score numeric(5,2),
+  rubric_version text,
+  recommended_action text,             -- backtest_candidate | watch | discard
+  stage text not null default 'hypothesis'
+    check (stage in ('hypothesis', 'researching', 'validation', 'promising', 'rejected', 'licensed', 'launched')),
+  digest_sent_at timestamptz,
+  created_at timestamptz not null default now()
+);
+create index if not exists finance_hypotheses_score_idx on finance_hypotheses (testability_score desc);
+
+-- ---------------------------------------------------------------------------
 -- Your decisions — the feedback loop the system learns from
 -- ---------------------------------------------------------------------------
 create table if not exists reviews (
   id uuid primary key default gen_random_uuid(),
-  opportunity_id uuid not null references opportunities(id) on delete cascade,
+  opportunity_id uuid references opportunities(id) on delete cascade,
+  finance_hypothesis_id uuid references finance_hypotheses(id) on delete cascade,
+  check (opportunity_id is not null or finance_hypothesis_id is not null),
   decision text not null
     check (decision in ('hypothesis', 'researching', 'validation', 'promising', 'rejected', 'licensed', 'launched')),
   notes text,
   reviewed_at timestamptz not null default now()
 );
+-- upgrades for databases created by v1
+alter table reviews alter column opportunity_id drop not null;
+alter table reviews add column if not exists finance_hypothesis_id uuid references finance_hypotheses(id) on delete cascade;
 
 -- ---------------------------------------------------------------------------
 -- Audit + cost log for every LLM call
@@ -246,14 +286,17 @@ create table if not exists digests (
   id uuid primary key default gen_random_uuid(),
   sent_at timestamptz not null default now(),
   opportunity_ids uuid[] not null default '{}',
+  finance_hypothesis_ids uuid[] not null default '{}',
   html text not null,
   emailed boolean not null default false
 );
+alter table digests add column if not exists finance_hypothesis_ids uuid[] not null default '{}';  -- v1 upgrade
 
 -- Convenience view for the Supabase table editor
-create or replace view opportunity_board with (security_invoker = true) as
+drop view if exists opportunity_board;
+create view opportunity_board with (security_invoker = true) as
 select
-  o.id, o.title, o.stage, o.pipeline_status, o.total_score, o.evidence_grade,
+  o.id, o.sector, o.title, o.stage, o.pipeline_status, o.total_score, o.evidence_grade,
   o.target_customer, o.next_action, o.ip_pathway,
   (select string_agg(distinct i.name, '; ')
      from opportunity_papers op
@@ -266,11 +309,6 @@ from opportunities o
 order by o.total_score desc nulls last;
 
 -- ---------------------------------------------------------------------------
--- Upgrades for databases created by an earlier version of this file
--- ---------------------------------------------------------------------------
-alter table papers add column if not exists opportunities_generated_at timestamptz;
-
--- ---------------------------------------------------------------------------
 -- Supabase exposes the public schema through its REST API. Enabling row level security with
 -- no policies blocks the anon/authenticated API keys from reading or writing these tables;
 -- the pipeline connects as the database owner, which bypasses RLS.
@@ -280,7 +318,7 @@ declare t text;
 begin
   foreach t in array array['pipeline_state','institutions','search_queries','papers','paper_institutions',
     'paper_analyses','findings','opportunities','opportunity_papers','market_validations','evidence_items',
-    'opportunity_scores','reviews','agent_runs','digests']
+    'opportunity_scores','reviews','agent_runs','digests','finance_hypotheses']
   loop
     execute format('alter table %I enable row level security', t);
   end loop;

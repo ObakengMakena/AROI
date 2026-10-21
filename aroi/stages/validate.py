@@ -57,9 +57,9 @@ def validate_opportunity(conn, cfg, llm, o: dict[str, Any]) -> dict[str, Any]:
     conn.commit()
     brief = _opportunity_brief(conn, o)
     research = llm.research(
-        stage="validation_research",
+        stage=f"validation_research:{o['sector']}",
         model=cfg.research_model,
-        system=prompts.render(prompts.VALIDATION_SYSTEM, cfg.country),
+        system=prompts.render(prompts.VALIDATION_SYSTEM, cfg.country, o["sector"]),
         user=f"Research this product idea.\n\n{brief}",
         prompt_version=prompts.VALIDATION_VERSION,
         max_searches=cfg.web_searches_per_validation,
@@ -126,31 +126,34 @@ def validate_opportunity(conn, cfg, llm, o: dict[str, Any]) -> dict[str, Any]:
 
 
 def run(conn: psycopg.Connection, cfg, llm) -> dict[str, Any]:
-    opps = conn.execute(
-        """select * from opportunities where pipeline_status in ('generated','validating') and stage <> 'rejected'
-            order by generator_confidence desc nulls last, created_at limit %s""",
-        (cfg.validate_per_run,),
-    ).fetchall()
-    stats = {"validated": 0, "failed": 0, "sources": 0, "searches": 0}
-    for o in opps:
-        try:
-            r = validate_opportunity(conn, cfg, llm, o)
-        except BudgetExceeded:
-            conn.rollback()
-            conn.execute("update opportunities set pipeline_status='generated' where id=%s", (o["id"],))
+    stats: dict[str, Any] = {"validated": 0, "failed": 0, "sources": 0, "searches": 0, "by_sector": {}}
+    for key in cfg.sectors:
+        opps = conn.execute(
+            """select * from opportunities
+                where pipeline_status in ('generated','validating') and stage <> 'rejected' and sector = %s
+                order by generator_confidence desc nulls last, created_at limit %s""",
+            (key, cfg.validate_per_sector),
+        ).fetchall()
+        for o in opps:
+            try:
+                r = validate_opportunity(conn, cfg, llm, o)
+            except BudgetExceeded:
+                conn.rollback()
+                conn.execute("update opportunities set pipeline_status='generated' where id=%s", (o["id"],))
+                conn.commit()
+                raise
+            except Exception as e:
+                # 'failed' stops it being retried (and re-billed) every night; reset by hand to retry
+                conn.rollback()
+                conn.execute("update opportunities set pipeline_status='failed' where id=%s", (o["id"],))
+                conn.commit()
+                stats["failed"] += 1
+                log.warning("Validation failed for %s: %s", o["id"], e)
+                continue
             conn.commit()
-            raise
-        except Exception as e:
-            # 'failed' stops it being retried (and re-billed) every night; reset by hand to retry
-            conn.rollback()
-            conn.execute("update opportunities set pipeline_status='failed' where id=%s", (o["id"],))
-            conn.commit()
-            stats["failed"] += 1
-            log.warning("Validation failed for %s: %s", o["id"], e)
-            continue
-        conn.commit()
-        stats["validated"] += 1
-        stats["sources"] += r["sources"]
-        stats["searches"] += r["searches"]
+            stats["validated"] += 1
+            stats["by_sector"][key] = stats["by_sector"].get(key, 0) + 1
+            stats["sources"] += r["sources"]
+            stats["searches"] += r["searches"]
     log.info("Validation: %s", stats)
     return stats

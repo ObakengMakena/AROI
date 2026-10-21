@@ -18,25 +18,23 @@ def _obj(props: dict, required: list[str] | None = None) -> dict:
 STR = {"type": "string"}
 STR_LIST = {"type": "array", "items": STR}
 
-TRIAGE = _obj(
-    {
-        "results": {
-            "type": "array",
-            "items": _obj(
-                {
-                    "ref": STR,
-                    "commercial_signal": {"type": "integer", "enum": list(range(11))},
-                    "sector": {
-                        "type": "string",
-                        "enum": ["crops_and_soil", "food_processing_and_preservation", "livestock_and_aquaculture",
-                                 "agri_waste_and_bioproducts", "farm_technology", "not_relevant"],
-                    },
-                    "reason": STR,
-                }
-            ),
+def triage_schema(categories: tuple[str, ...]) -> dict:
+    return _obj(
+        {
+            "results": {
+                "type": "array",
+                "items": _obj(
+                    {
+                        "ref": STR,
+                        "commercial_signal": {"type": "integer", "enum": list(range(11))},
+                        "category": {"type": "string", "enum": [*categories, "not_relevant"]},
+                        "reason": STR,
+                    }
+                ),
+            }
         }
-    }
-)
+    )
+
 
 ANALYSIS = _obj(
     {
@@ -58,12 +56,32 @@ ANALYSIS = _obj(
         "novelty_claim": STR,
         "readiness_level": {
             "type": "string",
-            "enum": ["review_or_theory", "lab", "greenhouse_or_pilot", "field_trial",
-                     "multi_site_or_commercial", "unclear"],
+            "enum": ["review_or_theory", "simulation_or_lab", "prototype_or_pilot", "real_world_trial",
+                     "certified_or_commercial", "unclear"],
         },
         "readiness_evidence": STR_LIST,
         "applications_to_investigate": STR_LIST,
         "missing_information": STR_LIST,
+        "evidence_confidence": {"type": "number"},
+    }
+)
+
+_FINDINGS = ANALYSIS["properties"]["findings"]
+
+FINANCE_ANALYSIS = _obj(
+    {
+        "hypothesis": STR,
+        "signal_definition": STR,
+        "instruments_and_market": STR,
+        "data_period": STR,
+        "data_needed": STR_LIST,
+        "out_of_sample_tested": {"type": "boolean"},
+        "transaction_costs_modelled": {"type": "boolean"},
+        "liquidity_considered": {"type": "boolean"},
+        "reported_performance": STR,
+        "findings": _FINDINGS,
+        "red_flags": STR_LIST,
+        "replication_difficulty": {"type": "string", "enum": ["easy", "moderate", "hard"]},
         "evidence_confidence": {"type": "number"},
     }
 )

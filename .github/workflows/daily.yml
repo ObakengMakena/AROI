@@ -17,13 +17,16 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       OPENALEX_API_KEY: ${{ secrets.OPENALEX_API_KEY }}
       CONTACT_EMAIL: ${{ secrets.CONTACT_EMAIL }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      MONTHLY_BUDGET_USD: ${{ vars.MONTHLY_BUDGET_USD || '20' }}
+      MONTHLY_BUDGET_USD: ${{ vars.MONTHLY_BUDGET_USD || '45' }}
+      SECTORS: ${{ vars.SECTORS }}                      # empty = all five
+      ANALYZE_PER_SECTOR: ${{ vars.ANALYZE_PER_SECTOR }}
+      VALIDATE_PER_SECTOR: ${{ vars.VALIDATE_PER_SECTOR }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

@@ -8,7 +8,7 @@ from typing import Any
 import psycopg
 from psycopg.types.json import Jsonb
 
-from .. import prompts, schemas
+from .. import prompts, schemas, sectors
 from ..llm import BudgetExceeded
 from ..scoring import clamp01
 
@@ -17,7 +17,13 @@ log = logging.getLogger(__name__)
 PUBLIC_TYPES = {"education", "government", "facility", "nonprofit", "healthcare", "archive"}
 
 
-def ip_pathway(institutions: list[dict[str, Any]], country: str) -> str:
+def ip_pathway(institutions: list[dict[str, Any]], country: str, sector_key: str | None = None) -> str:
+    base = _ip_base(institutions, country)
+    note = sectors.get(sector_key).ip_note.get(country.upper()) if sector_key else None
+    return f"{base} {note}" if note else base
+
+
+def _ip_base(institutions: list[dict[str, Any]], country: str) -> str:
     local = [i for i in institutions if (i["country_code"] or "").upper() == country.upper()]
     public_local = [i for i in local if (i["type"] or "") in PUBLIC_TYPES]
     if country.upper() == "ZA" and public_local:
@@ -75,10 +81,11 @@ def generate_for_paper(conn, cfg, llm, p: dict[str, Any]) -> dict[str, int]:
         f"<findings>\n{findings_text}\n</findings>\n\n"
         f"<analyst_application_ideas>\n{'; '.join(analysis['applications_to_investigate'])}\n</analyst_application_ideas>"
     )
+    sector_key = p["sector"] or "agriculture"
     out = llm.structured(
-        stage="opportunities",
+        stage=f"opportunities:{sector_key}",
         model=cfg.analysis_model,
-        system=prompts.render(prompts.OPPORTUNITY_SYSTEM, cfg.country),
+        system=prompts.render(prompts.OPPORTUNITY_SYSTEM, cfg.country, sector_key),
         user=user,
         schema=schemas.OPPORTUNITIES,
         prompt_version=prompts.OPPORTUNITY_VERSION,
@@ -86,7 +93,7 @@ def generate_for_paper(conn, cfg, llm, p: dict[str, Any]) -> dict[str, int]:
         paper_id=p["id"],
     )
     created = merged = 0
-    pathway = ip_pathway(institutions, cfg.country)
+    pathway = ip_pathway(institutions, cfg.country, sector_key)
     with conn.transaction():
         for o in (out.get("opportunities") or [])[:3]:
             title = (o.get("title") or "").strip()
@@ -97,7 +104,7 @@ def generate_for_paper(conn, cfg, llm, p: dict[str, Any]) -> dict[str, int]:
                 """select id, similarity(title, %(t)s) as sim from opportunities
                     where sector=%(s)s and target_country=%(c)s and similarity(title, %(t)s) >= %(min)s
                     order by sim desc limit 1""",
-                {"t": title, "s": cfg.sector, "c": cfg.country, "min": cfg.merge_similarity},
+                {"t": title, "s": sector_key, "c": cfg.country, "min": cfg.merge_similarity},
             ).fetchone()
             if match:
                 conn.execute(
@@ -126,7 +133,7 @@ def generate_for_paper(conn, cfg, llm, p: dict[str, Any]) -> dict[str, int]:
                      ip_pathway, next_experiment, generator_confidence)
                    values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) returning id""",
                 (
-                    title[:300], description, cfg.sector, cfg.country, o.get("customer_problem"),
+                    title[:300], description, sector_key, cfg.country, o.get("customer_problem"),
                     o.get("target_customer"), o.get("proposed_solution"), o.get("revenue_model"),
                     Jsonb((o.get("commercial_assumptions") or []) + [f"Delivery needs: {d}" for d in o.get("delivery_requirements") or []]),
                     Jsonb(o.get("key_risks") or []), pathway, o.get("cheapest_disproving_experiment"),
@@ -144,14 +151,15 @@ def generate_for_paper(conn, cfg, llm, p: dict[str, Any]) -> dict[str, int]:
 
 
 def run(conn: psycopg.Connection, cfg, llm) -> dict[str, Any]:
+    product_sectors = [k for k in cfg.sectors if sectors.get(k).kind == "product"]
     papers = conn.execute(
         """select p.* from papers p
              join lateral (select evidence_confidence from paper_analyses a where a.paper_id = p.id
                            order by created_at desc limit 1) a on true
             where p.status = 'analyzed' and p.opportunities_generated_at is null
-              and a.evidence_confidence >= %s
+              and a.evidence_confidence >= %s and p.sector = any(%s)
             order by (%s = any(p.countries)) desc, a.evidence_confidence desc, p.triage_score desc""",
-        (cfg.min_evidence_for_opportunities, cfg.country.upper()),
+        (cfg.min_evidence_for_opportunities, product_sectors, cfg.country.upper()),
     ).fetchall()
     # papers below the evidence bar are marked done so they aren't re-checked forever
     conn.execute(

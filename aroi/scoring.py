@@ -64,3 +64,38 @@ def clamp01(x: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
     return max(0.0, min(1.0, v))
+
+
+# ---------------------------------------------------------------------------
+# Quant finance track: how worth re-testing is a paper's hypothesis? (never "how profitable")
+# ---------------------------------------------------------------------------
+FINANCE_RUBRIC_VERSION = "finance-testability-v1"
+
+
+def testability_score(
+    *,
+    out_of_sample: bool,
+    costs_modelled: bool,
+    liquidity_considered: bool,
+    replication: str,
+    verified_quotes: int,
+    evidence_confidence: float,
+    red_flags: int,
+) -> float:
+    s = 0.0
+    s += 25 if out_of_sample else 0
+    s += 20 if costs_modelled else 0
+    s += 10 if liquidity_considered else 0
+    s += {"easy": 15, "moderate": 8}.get(replication, 0)
+    s += 10 if verified_quotes > 0 else 0
+    s += 20 * clamp01(evidence_confidence)
+    s -= min(25, 5 * max(0, red_flags))
+    return round(max(0.0, min(100.0, s)), 2)
+
+
+def finance_action(score: float) -> str:
+    if score >= 60:
+        return "backtest_candidate"
+    if score >= 40:
+        return "watch"
+    return "discard"

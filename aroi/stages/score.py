@@ -68,9 +68,9 @@ def build_case(conn, o: dict[str, Any]) -> tuple[str, int, int]:
 def score_opportunity(conn, cfg, llm, o: dict[str, Any]) -> dict[str, Any]:
     case, verified_quotes, web_sources = build_case(conn, o)
     out = llm.structured(
-        stage="review",
+        stage=f"review:{o['sector']}",
         model=cfg.review_model,
-        system=prompts.render(prompts.REVIEW_SYSTEM, cfg.country),
+        system=prompts.render(prompts.REVIEW_SYSTEM, cfg.country, o["sector"]),
         user=case,
         schema=schemas.REVIEW,
         prompt_version=prompts.REVIEW_VERSION,

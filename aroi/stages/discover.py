@@ -1,8 +1,9 @@
-"""Stage 1 — Research Scout. Pulls new works from OpenAlex and upserts deduplicated paper rows.
+"""Stage 1 — Research Scout. Pulls new works from OpenAlex and upserts deduplicated paper rows,
+for every enabled sector.
 
-Two nets:
+Two nets per sector:
   * The sweep: every new work with an author at an institution in the target country whose primary
-    topic falls in the configured OpenAlex fields. Cheap list+filter calls; catches papers that never
+    topic falls in the sector's OpenAlex fields/subfields (see aroi/sectors.py). Cheap list+filter calls; catches papers that never
     use your keywords.
   * Keyword searches from `search_queries`: targeted boolean searches across neighbouring countries,
     for research that could be adapted to the target market.
@@ -17,8 +18,10 @@ from typing import Any
 import psycopg
 from psycopg.types.json import Jsonb
 
+from .. import sectors
 from ..db import get_state, set_state
 from ..normalize import parse_work
+from ..openalex import OpenAlexError
 
 log = logging.getLogger(__name__)
 
@@ -30,7 +33,7 @@ def _year(d: str | None) -> int | None:
         return None
 
 
-def upsert_paper(conn: psycopg.Connection, p: dict[str, Any], found_by: str) -> tuple[str, bool]:
+def upsert_paper(conn: psycopg.Connection, p: dict[str, Any], found_by: str, sector: str) -> tuple[str, bool]:
     """Insert or update one paper. Returns (paper_id, is_new). Dedup order: OpenAlex id, DOI,
     then title fingerprint + publication year."""
     if not p["title"] or len(p["title_fingerprint"]) < 8:
@@ -71,18 +74,19 @@ def upsert_paper(conn: psycopg.Connection, p: dict[str, Any], found_by: str) -> 
         paper_id = conn.execute(
             """insert into papers (openalex_id, doi, title, title_fingerprint, abstract, publication_date,
                  work_type, language, source_name, landing_url, oa_status, oa_url, has_grobid, primary_field,
-                 primary_subfield, primary_topic, countries, authors, cited_by_count, found_by, metadata, status)
+                 primary_subfield, primary_topic, countries, authors, cited_by_count, found_by, metadata, status, sector)
                values (%(openalex_id)s, %(doi)s, %(title)s, %(title_fingerprint)s, %(abstract)s,
                  %(publication_date)s, %(work_type)s, %(language)s, %(source_name)s, %(landing_url)s,
                  %(oa_status)s, %(oa_url)s, %(has_grobid)s, %(primary_field)s, %(primary_subfield)s,
                  %(primary_topic)s, %(countries)s, %(authors)s, %(cited_by_count)s, array[%(found_by)s],
-                 %(metadata)s, %(status)s)
+                 %(metadata)s, %(status)s, %(sector)s)
                returning id""",
             {
                 **p,
                 "authors": Jsonb(p["authors"]),
                 "metadata": Jsonb(metadata),
                 "found_by": found_by,
+                "sector": sector,
                 # no abstract -> nothing to analyse cheaply; keep the record but skip triage
                 "status": "new" if p["abstract"] and len(p["abstract"]) >= 200 else "triaged_out",
             },
@@ -108,13 +112,13 @@ def upsert_paper(conn: psycopg.Connection, p: dict[str, Any], found_by: str) -> 
     return paper_id, is_new
 
 
-def _ingest(conn, works, found_by: str, stats: dict[str, int]) -> int:
+def _ingest(conn, works, found_by: str, sector: str, stats: dict[str, int]) -> int:
     n = 0
     for w in works:
         n += 1
         try:
             with conn.transaction():
-                _, is_new = upsert_paper(conn, parse_work(w), found_by)
+                _, is_new = upsert_paper(conn, parse_work(w), found_by, sector)
             stats["new" if is_new else "updated"] += 1
         except Exception as e:  # one malformed record must not sink the run
             stats["skipped"] += 1
@@ -122,36 +126,36 @@ def _ingest(conn, works, found_by: str, stats: dict[str, int]) -> int:
     return n
 
 
-def run(conn: psycopg.Connection, cfg, oa) -> dict[str, Any]:
-    stats: dict[str, Any] = {"new": 0, "updated": 0, "skipped": 0, "queries": 0}
+def _sweep(conn, cfg, oa, sector, stats) -> None:
     today = date.today()
-
-    # ---- net 1: country + field sweep ---------------------------------------
-    last = get_state(conn, f"sweep_last_date:{cfg.country}:{cfg.sweep_fields}")
+    key = f"sweep_last_date:{cfg.country}:{sector.key}"
+    last = get_state(conn, key)
     since = (
         date.fromisoformat(last) - timedelta(days=cfg.sweep_overlap_days)
         if last
         else today - timedelta(days=cfg.first_run_lookback_days)
     )
-    sweep_filter = ",".join(
+    flt = ",".join(
         [
             f"institutions.country_code:{cfg.country.lower()}",
-            f"primary_topic.field.id:{cfg.sweep_fields}",
+            sector.sweep_filter,
             f"from_publication_date:{since.isoformat()}",
             "has_abstract:true",
             f"type:{cfg.sweep_work_types}",
         ]
     )
-    log.info("Sweep filter: %s", sweep_filter)
-    stats["sweep_seen"] = _ingest(
-        conn, oa.iter_works(sweep_filter, max_results=cfg.max_sweep_pages * 100), "sweep", stats
+    log.info("[%s] sweep filter: %s", sector.key, flt)
+    stats["sweep_seen"] += _ingest(
+        conn, oa.iter_works(flt, max_results=cfg.max_sweep_pages * 100), f"sweep:{sector.key}", sector.key, stats
     )
-    set_state(conn, f"sweep_last_date:{cfg.country}:{cfg.sweep_fields}", today.isoformat())
+    set_state(conn, key, today.isoformat())
     conn.commit()
 
-    # ---- net 2: keyword searches ----------------------------------------------
+
+def _keyword_queries(conn, cfg, oa, sector, stats) -> None:
+    today = date.today()
     queries = conn.execute(
-        "select * from search_queries where active and sector = %s order by theme", (cfg.sector,)
+        "select * from search_queries where active and sector = %s order by theme", (sector.key,)
     ).fetchall()
     for q in queries:
         q_since = (
@@ -163,20 +167,53 @@ def run(conn: psycopg.Connection, cfg, oa) -> dict[str, Any]:
         if q["extra_filter"]:
             flt += "," + q["extra_filter"]
         before = stats["new"]
-        seen = _ingest(
-            conn,
-            oa.iter_works(flt, search=q["query_text"], per_page=50, max_results=cfg.keyword_results_per_query),
-            f"query:{q['theme'] or q['query_text'][:40]}",
-            stats,
-        )
+        try:
+            seen = _ingest(
+                conn,
+                oa.iter_works(flt, search=q["query_text"], per_page=50, max_results=cfg.keyword_results_per_query),
+                f"query:{sector.key}:{q['theme'] or q['query_text'][:40]}",
+                sector.key,
+                stats,
+            )
+        except OpenAlexError as e:
+            conn.rollback()
+            if "budget" in str(e).lower():
+                raise
+            stats["query_errors"] += 1
+            log.warning("[%s] query %r failed, skipping: %s", sector.key, q["query_text"][:60], e)
+            continue
         conn.execute(
             "update search_queries set last_run_at = %s, results_last_run = %s where id = %s",
             (datetime.now(timezone.utc), seen, q["id"]),
         )
         conn.commit()
         stats["queries"] += 1
-        log.info("Query %r: %s results, %s new", q["query_text"][:60], seen, stats["new"] - before)
+        log.info("[%s] query %r: %s results, %s new", sector.key, q["query_text"][:60], seen, stats["new"] - before)
 
+
+def run(conn: psycopg.Connection, cfg, oa) -> dict[str, Any]:
+    stats: dict[str, Any] = {"new": 0, "updated": 0, "skipped": 0, "queries": 0, "query_errors": 0, "sweep_seen": 0}
+    per_sector: dict[str, int] = {}
+    for key in cfg.sectors:
+        sector = sectors.get(key)
+        before = stats["new"]
+        try:
+            _sweep(conn, cfg, oa, sector, stats)
+        except OpenAlexError as e:
+            conn.rollback()
+            if "budget" in str(e).lower():
+                log.error("OpenAlex budget exhausted during %s sweep; stopping discovery", key)
+                break
+            log.error("[%s] sweep failed: %s", key, e)
+            stats.setdefault("sweep_errors", []).append(key)
+        try:
+            _keyword_queries(conn, cfg, oa, sector, stats)
+        except OpenAlexError as e:
+            conn.rollback()
+            log.error("OpenAlex budget exhausted during %s queries; stopping discovery: %s", key, e)
+            break
+        per_sector[key] = stats["new"] - before
+    stats["new_by_sector"] = per_sector
     stats["openalex_cost_usd"] = round(oa.cost_usd, 4)
     log.info("Discovery: %s", json.dumps(stats))
     return stats

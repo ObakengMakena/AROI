@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       opportunity:
-        description: "Opportunity id (the first 8 characters from the digest are enough)"
+        description: "Opportunity or finance hypothesis id (the first 8 characters from the digest are enough)"
         required: true
       decision:
         description: "New stage"

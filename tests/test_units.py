@@ -1,6 +1,7 @@
 import pytest
 
-from aroi import schemas
+from aroi import prompts, schemas, sectors
+from aroi.cli import rotate_sectors
 from aroi.llm import cost_of
 from aroi.normalize import (
     normalize_doi,
@@ -10,7 +11,8 @@ from aroi.normalize import (
     tei_to_text,
     title_fingerprint,
 )
-from aroi.scoring import CRITERIA, action_for, cap_grade, weighted_score
+from aroi import scoring
+from aroi.scoring import CRITERIA, action_for, cap_grade, finance_action, weighted_score
 
 from .fakes import make_work
 
@@ -110,12 +112,40 @@ def _walk(node, path="$"):
             yield from _walk(v, f"{path}[{i}]")
 
 
-@pytest.mark.parametrize("name", ["TRIAGE", "ANALYSIS", "OPPORTUNITIES", "VALIDATION", "REVIEW"])
+@pytest.mark.parametrize("name", ["TRIAGE", "ANALYSIS", "FINANCE_ANALYSIS", "OPPORTUNITIES", "VALIDATION", "REVIEW"])
 def test_schemas_fit_structured_output_rules(name):
-    schema = getattr(schemas, name)
+    schema = schemas.triage_schema(("a", "b")) if name == "TRIAGE" else getattr(schemas, name)
     unsupported = {"minimum", "maximum", "minLength", "maxLength", "multipleOf", "maxItems"}
     for path, node in _walk(schema):
         if node.get("type") == "object":
             assert node.get("additionalProperties") is False, path
             assert sorted(node["required"]) == sorted(node["properties"]), path
         assert not (unsupported & set(node)), path
+
+
+def test_testability_score():
+    best = scoring.testability_score(out_of_sample=True, costs_modelled=True, liquidity_considered=True,
+                             replication="easy", verified_quotes=2, evidence_confidence=1.0, red_flags=0)
+    assert best == 100.0 and finance_action(best) == "backtest_candidate"
+    weak = scoring.testability_score(out_of_sample=False, costs_modelled=False, liquidity_considered=False,
+                             replication="hard", verified_quotes=0, evidence_confidence=0.5, red_flags=8)
+    assert weak == 0.0 and finance_action(weak) == "discard"
+    assert finance_action(45) == "watch"
+
+
+def test_rotate_sectors():
+    keys = ["a", "b", "c"]
+    assert rotate_sectors(keys, 0) == ["a", "b", "c"]
+    assert rotate_sectors(keys, 4) == ["b", "c", "a"]
+    assert rotate_sectors([], 3) == []
+
+
+@pytest.mark.parametrize("key", list(sectors.SECTORS))
+def test_every_sector_renders_every_prompt(key):
+    for name in ("TRIAGE_SYSTEM", "ANALYSIS_SYSTEM", "FINANCE_ANALYSIS_SYSTEM", "OPPORTUNITY_SYSTEM",
+                 "VALIDATION_SYSTEM", "REVIEW_SYSTEM"):
+        text = prompts.render(getattr(prompts, name), "ZA", key)
+        assert "{" not in text.replace("{{", ""), (key, name)
+    sec = sectors.get(key)
+    assert sec.context.get("ZA") and sec.triage_categories and "not_relevant" not in sec.triage_categories
+    assert sec.sweep_filter.startswith("primary_topic.")
