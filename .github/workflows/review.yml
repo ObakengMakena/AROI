@@ -1,0 +1,37 @@
+name: Record a decision
+
+# Run from the GitHub app or website: Actions → "Record a decision" → Run workflow.
+# Lets you log decisions from your phone without a laptop.
+on:
+  workflow_dispatch:
+    inputs:
+      opportunity:
+        description: "Opportunity or finance hypothesis id (the first 8 characters from the digest are enough)"
+        required: true
+      decision:
+        description: "New stage"
+        required: true
+        type: choice
+        options: [promising, rejected, researching, validation, licensed, launched, hypothesis]
+      notes:
+        description: "Why? (this is what the system learns from)"
+        required: false
+        default: ""
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      OPP: ${{ github.event.inputs.opportunity }}
+      DECISION: ${{ github.event.inputs.decision }}
+      NOTES: ${{ github.event.inputs.notes }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install .
+      - run: python -m aroi review "$OPP" "$DECISION" "$NOTES"

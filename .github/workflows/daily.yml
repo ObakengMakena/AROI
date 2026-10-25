@@ -1,0 +1,35 @@
+name: Daily research pipeline
+
+on:
+  schedule:
+    - cron: "17 3 * * *"   # 05:17 South Africa time, every day (cron is UTC)
+  workflow_dispatch:
+
+concurrency:
+  group: aroi-pipeline
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      OPENALEX_API_KEY: ${{ secrets.OPENALEX_API_KEY }}
+      CONTACT_EMAIL: ${{ secrets.CONTACT_EMAIL }}
+      MONTHLY_BUDGET_USD: ${{ vars.MONTHLY_BUDGET_USD || '30' }}
+      SECTORS: ${{ vars.SECTORS }}                      # empty = all five
+      ANALYZE_PER_SECTOR: ${{ vars.ANALYZE_PER_SECTOR }}
+      VALIDATE_PER_SECTOR: ${{ vars.VALIDATE_PER_SECTOR }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install .
+      - name: Run pipeline
+        run: python -m aroi daily   # discover (OpenAlex) + ingest agent results + enqueue agent tasks
+      - name: Status
+        if: always()
+        run: python -m aroi status
