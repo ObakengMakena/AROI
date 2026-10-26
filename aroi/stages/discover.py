@@ -21,7 +21,7 @@ from psycopg.types.json import Jsonb
 from .. import sectors
 from ..db import get_state, set_state
 from ..normalize import parse_work
-from ..openalex import OpenAlexError
+from ..openalex import OpenAlexBudgetError, OpenAlexError, OpenAlexPlanError
 
 log = logging.getLogger(__name__)
 
@@ -205,10 +205,11 @@ def _keyword_queries(conn, cfg, oa, sector, stats) -> None:
                 sector.key,
                 stats,
             )
+        except (OpenAlexBudgetError, OpenAlexPlanError):
+            conn.rollback()
+            raise
         except OpenAlexError as e:
             conn.rollback()
-            if "budget" in str(e).lower():
-                raise
             stats["query_errors"] += 1
             log.warning("[%s] query %r failed, skipping: %s", sector.key, q["query_text"][:60], e)
             continue
@@ -221,29 +222,78 @@ def _keyword_queries(conn, cfg, oa, sector, stats) -> None:
         log.info("[%s] query %r: %s results, %s new", sector.key, q["query_text"][:60], seen, stats["new"] - before)
 
 
+def _fallback_date_field(cfg, stats, e) -> bool:
+    """created_date filters/sorts need a paid OpenAlex plan. Fall back to publication_date once."""
+    if cfg.discovery_date_field == "publication_date":
+        return False
+    log.error("OpenAlex refused created_date (%s). Falling back to DISCOVERY_DATE_FIELD=publication_date; "
+              "set that variable to silence this.", e)
+    cfg.discovery_date_field = "publication_date"
+    stats["date_field_fallback"] = "publication_date"
+    stats["problems"].append("created_date filters need a paid OpenAlex plan; fell back to publication_date")
+    return True
+
+
+def _with_fallback(fn, conn, cfg, stats):
+    try:
+        fn()
+    except OpenAlexPlanError as e:
+        conn.rollback()
+        if not _fallback_date_field(cfg, stats, e):
+            raise
+        fn()
+
+
 def run(conn: psycopg.Connection, cfg, oa) -> dict[str, Any]:
-    stats: dict[str, Any] = {"new": 0, "updated": 0, "skipped": 0, "queries": 0, "query_errors": 0, "sweep_seen": 0}
+    """Never a silent no-op: anything that makes discovery see nothing for a config/API reason goes into
+    stats['problems'], and stats['fatal'] (which fails the pipeline run) when no sweep succeeded."""
+    stats: dict[str, Any] = {"new": 0, "updated": 0, "skipped": 0, "queries": 0, "query_errors": 0, "sweep_seen": 0,
+                             "sweeps_ok": 0, "problems": [], "fatal": []}
     per_sector: dict[str, int] = {}
+    if not cfg.sectors:
+        stats["fatal"].append("no sectors enabled (check the SECTORS variable)")
+    if not getattr(oa, "api_key", "x"):
+        stats["problems"].append("OPENALEX_API_KEY is not set: keyless requests share a tiny daily budget")
+    n_queries = conn.execute(
+        "select count(*) n from search_queries where active and sector = any(%s)", (list(cfg.sectors),)
+    ).fetchone()["n"]
+    if n_queries == 0:
+        stats["problems"].append("no active search_queries for the enabled sectors (load sql/seed.sql)")
     for key in cfg.sectors:
         sector = sectors.get(key)
         before = stats["new"]
         try:
-            _sweep(conn, cfg, oa, sector, stats)
+            _with_fallback(lambda: _sweep(conn, cfg, oa, sector, stats), conn, cfg, stats)
+            stats["sweeps_ok"] += 1
+        except OpenAlexBudgetError as e:
+            conn.rollback()
+            log.error("OpenAlex budget exhausted during %s sweep; stopping discovery: %s", key, e)
+            stats["fatal"].append(f"OpenAlex daily budget exhausted during the {key} sweep: {str(e)[:200]}")
+            break
         except OpenAlexError as e:
             conn.rollback()
-            if "budget" in str(e).lower():
-                log.error("OpenAlex budget exhausted during %s sweep; stopping discovery", key)
-                break
             log.error("[%s] sweep failed: %s", key, e)
             stats.setdefault("sweep_errors", []).append(key)
+            stats["problems"].append(f"{key} sweep failed: {str(e)[:200]}")
         try:
-            _keyword_queries(conn, cfg, oa, sector, stats)
-        except OpenAlexError as e:
+            _with_fallback(lambda: _keyword_queries(conn, cfg, oa, sector, stats), conn, cfg, stats)
+        except OpenAlexBudgetError as e:
             conn.rollback()
             log.error("OpenAlex budget exhausted during %s queries; stopping discovery: %s", key, e)
+            stats["fatal"].append(f"OpenAlex daily budget exhausted during {key} keyword queries")
             break
+        except OpenAlexError as e:
+            conn.rollback()
+            log.error("[%s] keyword queries stopped: %s", key, e)
+            stats["problems"].append(f"{key} keyword queries stopped: {str(e)[:200]}")
         per_sector[key] = stats["new"] - before
+    if cfg.sectors and stats["sweeps_ok"] == 0 and not stats["fatal"]:
+        stats["fatal"].append("every sector sweep failed; see problems")
+    if stats["sweeps_ok"] and stats["sweep_seen"] == 0 and stats["queries"] == 0:
+        stats["problems"].append("discovery ran but OpenAlex returned 0 works for every sweep and query")
     stats["new_by_sector"] = per_sector
     stats["openalex_cost_usd"] = round(oa.cost_usd, 4)
+    for p in stats["problems"] + stats["fatal"]:
+        log.warning("Discovery problem: %s", p)
     log.info("Discovery: %s", json.dumps(stats))
     return stats

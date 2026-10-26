@@ -60,8 +60,9 @@ class Config:
     # --- agent work queue (AI stages are done by Grok Bot agents) ------------
     task_lease_minutes: int = field(default_factory=lambda: _int("TASK_LEASE_MINUTES", 120))
     task_max_attempts: int = field(default_factory=lambda: _int("TASK_MAX_ATTEMPTS", 3))
-    # created_date catches papers OpenAlex indexes long after their publication date (theses!)
-    discovery_date_field: str = field(default_factory=lambda: os.getenv("DISCOVERY_DATE_FIELD", "created_date"))
+    # publication_date works on the free OpenAlex plan. created_date (catches back-dated records) needs
+    # Member+/Partner; if refused, discovery falls back to publication_date and reports it.
+    discovery_date_field: str = field(default_factory=lambda: os.getenv("DISCOVERY_DATE_FIELD") or "publication_date")
 
     # --- throughput & thresholds ----------------------------------------------
     triage_batch_size: int = field(default_factory=lambda: _int("TRIAGE_BATCH_SIZE", 15))

@@ -18,6 +18,7 @@ jobs:
       OPENALEX_API_KEY: ${{ secrets.OPENALEX_API_KEY }}
       CONTACT_EMAIL: ${{ secrets.CONTACT_EMAIL }}
       MONTHLY_BUDGET_USD: ${{ vars.MONTHLY_BUDGET_USD || '30' }}
+      DISCOVERY_DATE_FIELD: ${{ vars.DISCOVERY_DATE_FIELD }}
       SECTORS: ${{ vars.SECTORS }}                      # empty = all five
       ANALYZE_PER_SECTOR: ${{ vars.ANALYZE_PER_SECTOR }}
       VALIDATE_PER_SECTOR: ${{ vars.VALIDATE_PER_SECTOR }}

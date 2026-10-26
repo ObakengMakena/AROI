@@ -59,7 +59,8 @@ def test_full_pipeline(env):
     for frag in ("primary_topic.field.id%3A11", "primary_topic.field.id%3A21", "primary_topic.subfield.id%3A1702%7C1707",
                  "primary_topic.subfield.id%3A2205%7C2215%7C3322", "primary_topic.subfield.id%3A2003"):
         assert any(frag in c and "institutions.country_code%3Aza" in c for c in sweeps), frag
-    assert all("from_created_date" in c and "sort=created_date%3Aasc" in c for c in sweeps)
+    assert all("from_publication_date" in c and "sort=publication_date%3Aasc" in c for c in sweeps)
+    assert s["problems"] == [] and s["fatal"] == [] and s["sweeps_ok"] == 5
     assert "api_key=test-key" in sweeps[0]
     assert s["queries"] == 36 and s["query_errors"] == 1  # 37 seeded queries, the TinyML one fails
     papers = conn.execute("select openalex_id, doi, status, found_by, sector, sectors from papers order by openalex_id").fetchall()
@@ -291,6 +292,7 @@ def test_truncated_sweep_does_not_skip_ahead(env):
     from .fakes import make_work
 
     conn, cfg, oa, bot, _ = env
+    cfg.discovery_date_field = "created_date"  # paid OpenAlex plans only
 
     class StubOA:
         last_count = 500
@@ -322,3 +324,30 @@ def test_digest_heartbeat_warns_when_stale(env):
     h = digest.build(conn, cfg)["health"]
     text = " ".join(h["warnings"])
     assert "No pipeline run for 72 hours" in text and "had errors" in text
+
+
+def test_created_date_on_free_plan_falls_back_loudly(env):
+    conn, cfg, oa, bot, calls = env
+    cfg.discovery_date_field = "created_date"
+    ok, res = run_pipeline(conn, cfg, "daily", ["discover"], oa)
+    d = res["discover"]
+    assert ok and d["date_field_fallback"] == "publication_date" and d["sweeps_ok"] == 5
+    assert d["sweep_seen"] > 0 and any("paid OpenAlex plan" in p for p in d["problems"])
+    assert "Discovery: created_date filters need a paid" in " ".join(digest.build(conn, cfg)["health"]["warnings"])
+
+
+def test_openalex_budget_exhausted_fails_the_run(env):
+    conn, cfg, _, bot, calls = env
+    oa = OpenAlexClient("k", "me@example.com", transport=openalex_transport(calls, budget_exhausted=True))
+    ok, res = run_pipeline(conn, cfg, "daily", ["discover"], oa)
+    assert not ok and "budget exhausted" in res["discover"]["fatal"][0]
+    assert conn.execute("select ok from pipeline_runs").fetchone()["ok"] is False
+    assert any("budget exhausted" in w for w in digest.build(conn, cfg)["health"]["warnings"])
+
+
+def test_missing_seed_queries_is_reported(env):
+    conn, cfg, oa, bot, calls = env
+    conn.execute("delete from search_queries")
+    conn.commit()
+    d = run_stage("discover", conn, cfg, oa)
+    assert any("search_queries" in p for p in d["problems"]) and d["sweeps_ok"] == 5

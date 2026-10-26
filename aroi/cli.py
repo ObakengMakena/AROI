@@ -78,6 +78,9 @@ def run_pipeline(conn, cfg: Config, command: str, steps: list[str], oa=None) -> 
                 results["ingest"] = agent_queue.ingest(conn, cfg)
             else:
                 results[step] = run_stage(step, conn, cfg, oa)
+                if isinstance(results[step], dict) and results[step].get("fatal"):
+                    log.error("Step %s did not do its job: %s", step, results[step]["fatal"])
+                    failed = True
         except BudgetExceeded as e:
             conn.rollback()
             log.warning("Skipping %s: %s", step, e)

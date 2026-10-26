@@ -106,7 +106,13 @@ GROBID = """<TEI xmlns="http://www.tei-c.org/ns/1.0"><text><body>
 <p>Bag integrity remained above 95% after three seasons of reuse.</p></div></body></text></TEI>"""
 
 
-def openalex_transport(calls: list):
+PLAN_MSG = ('{"error":"Plan upgrade required","message":"The \\"from_created_date:2026-07-28\\" filter is part '
+            'of daily sync, which comes with the Member+ and Partner plans."}')
+BUDGET_MSG = '{"error":"Insufficient budget","message":"Insufficient budget. Keyless requests ... resets at midnight UTC"}'
+
+
+def openalex_transport(calls: list, budget_exhausted: bool = False):
+    """Mimics live OpenAlex (Oct 2026): created_date filters/sorts are plan-gated and answer 429."""
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(str(request.url))
         url = urlparse(str(request.url))
@@ -114,6 +120,10 @@ def openalex_transport(calls: list):
             return httpx.Response(200, text=GROBID)
         q = parse_qs(url.query)
         flt = q.get("filter", [""])[0]
+        if budget_exhausted:
+            return httpx.Response(429, text=BUDGET_MSG)
+        if "created_date" in flt or "created_date" in q.get("sort", [""])[0]:
+            return httpx.Response(429, text=PLAN_MSG)
         search = q.get("search", [""])[0]
         if search:
             if "TinyML" in search:  # simulate a query OpenAlex rejects

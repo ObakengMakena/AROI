@@ -30,6 +30,17 @@ class OpenAlexError(RuntimeError):
     pass
 
 
+class OpenAlexBudgetError(OpenAlexError):
+    """Daily usage allowance exhausted (resets at midnight UTC)."""
+
+
+class OpenAlexPlanError(OpenAlexError):
+    """The request uses a feature the account's plan doesn't include (e.g. created_date filters/sorts)."""
+
+
+_PLAN_WORDS = ("plan upgrade", "daily sync", "member+")
+
+
 class OpenAlexClient:
     def __init__(
         self,
@@ -72,10 +83,14 @@ class OpenAlexClient:
                 delay *= 2
                 continue
             if r.status_code == 429:
-                body = r.text[:300]
+                body = r.text[:400]
+                low = body.lower()
+                # OpenAlex also answers 429 for plan-gated features: not a budget problem, never retry
+                if any(w in low for w in _PLAN_WORDS):
+                    raise OpenAlexPlanError(f"OpenAlex feature not in your plan: {body}")
                 # Out of daily budget: retrying won't help until midnight UTC.
-                if any(w in body.lower() for w in ("budget", "daily", "exhausted")):
-                    raise OpenAlexError(f"OpenAlex daily budget exhausted or rate limited: {body}")
+                if any(w in low for w in ("budget", "exhausted")):
+                    raise OpenAlexBudgetError(f"OpenAlex daily budget exhausted: {body}")
                 time.sleep(delay)
                 delay *= 2
                 continue

@@ -212,6 +212,13 @@ def _health(conn, cfg, since) -> dict[str, Any]:
             warnings.append(f"The last run ({last['command']}) had errors; see pipeline_runs.results.")
         if last["finished_at"] is None and age_h > 2:
             warnings.append("The last run never finished (crashed or timed out).")
+    disc = conn.execute(
+        """select results->'discover' d from pipeline_runs where results ? 'discover'
+            order by started_at desc limit 1"""
+    ).fetchone()
+    if disc and disc["d"]:
+        for p in (disc["d"].get("fatal") or []) + (disc["d"].get("problems") or []):
+            warnings.append(f"Discovery: {p}")
     if errs:
         warnings.append(f"{errs} pipeline run(s) with errors this period.")
     if q["failed_period"]:
