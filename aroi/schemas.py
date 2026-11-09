@@ -1,6 +1,7 @@
-"""JSON schemas for structured outputs. Every object sets additionalProperties=false and lists all
-properties as required, as Claude's structured-outputs feature expects. Numeric ranges are not
-supported by the schema grammar, so they are enforced in code (see clamp helpers in the stages)."""
+"""Strict JSON schemas for the results Grok Bot agents submit to the work queue (aroi/agent_queue.py).
+Every object sets additionalProperties=false and lists all properties as required, so a submission
+with a missing, extra or misspelled field is rejected with a clear error instead of half-ingested.
+Numeric ranges are enforced here too (and clamped again in code, as a second line of defence)."""
 from __future__ import annotations
 
 from .scoring import CRITERIA
@@ -18,22 +19,21 @@ def _obj(props: dict, required: list[str] | None = None) -> dict:
 STR = {"type": "string"}
 STR_LIST = {"type": "array", "items": STR}
 
-def triage_schema(categories: tuple[str, ...]) -> dict:
-    return _obj(
-        {
-            "results": {
-                "type": "array",
-                "items": _obj(
-                    {
-                        "ref": STR,
-                        "commercial_signal": {"type": "integer", "enum": list(range(11))},
-                        "category": {"type": "string", "enum": [*categories, "not_relevant"]},
-                        "reason": STR,
-                    }
-                ),
-            }
-        }
-    )
+CONF = {"type": "number", "minimum": 0, "maximum": 1}
+NONEMPTY = {"type": "string", "minLength": 1}
+
+
+def triage_schema(categories: tuple[str, ...], sectors: tuple[str, ...] | None = None) -> dict:
+    item = {
+        "ref": STR,
+        "commercial_signal": {"type": "integer", "minimum": 0, "maximum": 10},
+        "category": {"type": "string", "enum": [*dict.fromkeys(categories), "not_relevant"]},
+        "reason": NONEMPTY,
+    }
+    if sectors:
+        # papers can belong to several sectors; the agent names the one it is triaging the paper into
+        item["sector"] = {"type": "string", "enum": list(sectors)}
+    return _obj({"results": {"type": "array", "items": _obj(item)}})
 
 
 ANALYSIS = _obj(
@@ -45,7 +45,7 @@ ANALYSIS = _obj(
             "type": "array",
             "items": _obj(
                 {
-                    "claim": STR,
+                    "claim": NONEMPTY,
                     "evidence_quote": STR,
                     "location": STR,
                     "measured_or_inferred": {"type": "string", "enum": ["measured", "inferred"]},
@@ -62,7 +62,7 @@ ANALYSIS = _obj(
         "readiness_evidence": STR_LIST,
         "applications_to_investigate": STR_LIST,
         "missing_information": STR_LIST,
-        "evidence_confidence": {"type": "number"},
+        "evidence_confidence": CONF,
     }
 )
 
@@ -82,7 +82,7 @@ FINANCE_ANALYSIS = _obj(
         "findings": _FINDINGS,
         "red_flags": STR_LIST,
         "replication_difficulty": {"type": "string", "enum": ["easy", "moderate", "hard"]},
-        "evidence_confidence": {"type": "number"},
+        "evidence_confidence": CONF,
     }
 )
 
@@ -103,14 +103,15 @@ OPPORTUNITIES = _obj(
                     "commercial_assumptions": STR_LIST,
                     "key_risks": STR_LIST,
                     "cheapest_disproving_experiment": STR,
-                    "confidence": {"type": "number"},
+                    "confidence": CONF,
                 }
             ),
         }
     }
 )
 
-_REF = {"type": "string", "description": "Source id like S3 from the memo's SOURCES list, or 'none'"}
+_REF = {"type": "string", "pattern": "^(S[0-9]+|none)$",
+        "description": "Source id like S3 from the `sources` list, or 'none'"}
 
 VALIDATION = _obj(
     {
@@ -124,6 +125,26 @@ VALIDATION = _obj(
         "pilot_plan": STR_LIST,
         "recommendation": {"type": "string", "enum": ["investigate", "park", "reject"]},
         "recommendation_reason": STR,
+    }
+)
+
+# What a validation agent submits: the structured fields above plus its memo and the list of pages it
+# actually fetched. Only sources with fetched=true and an http(s) URL are stored as evidence.
+SOURCE = _obj(
+    {
+        "id": {"type": "string", "pattern": "^S[0-9]+$"},
+        "url": {"type": "string", "pattern": "^https?://", "maxLength": 2000},
+        "title": STR,
+        "fetched": {"type": "boolean"},
+        "quoted_text": STR,
+    }
+)
+VALIDATION_SUBMISSION = _obj(
+    {
+        **VALIDATION["properties"],
+        "memo": NONEMPTY,
+        "searches_used": {"type": "integer", "minimum": 0, "maximum": 100},
+        "sources": {"type": "array", "items": SOURCE, "maxItems": 60},
     }
 )
 

@@ -26,6 +26,23 @@ TEMPLATE = """<!doctype html>
   <h1 style="font-size:24px;margin:4px 0 4px;">Research-to-business digest</h1>
   <div style="color:#6b6b63;font-size:14px;margin-bottom:20px;">{{ period }} · {{ total_leads }} new lead{{ '' if total_leads == 1 else 's' }}</div>
 
+  {% if health.warnings %}
+  <div style="background:#fdecea;border-left:4px solid #a3261d;border-radius:6px;padding:12px 14px;margin-bottom:16px;font-size:14px;">
+    <strong>Pipeline health:</strong>
+    <ul style="margin:6px 0 0 18px;padding:0;">{% for w in health.warnings %}<li>{{ w }}</li>{% endfor %}</ul>
+  </div>
+  {% endif %}
+
+  <table role="presentation" style="width:100%;border-collapse:collapse;background:#fff;border-radius:10px;margin-bottom:12px;font-size:13px;">
+    <tr style="color:#6b6b63;text-align:left;"><th style="padding:10px;font-weight:500;" colspan="8">Funnel this period</th></tr>
+    <tr style="color:#6b6b63;"><td style="padding:4px 10px;">Sector</td>{% for label in funnel_labels %}<td style="padding:4px 6px;text-align:right;">{{ label }}</td>{% endfor %}</tr>
+    {% for s in sectors %}
+    <tr style="border-top:1px solid #eee;"><td style="padding:6px 10px;">{{ s.name }}</td>{% for k in funnel_keys %}<td style="padding:6px 6px;text-align:right;">{{ s.funnel[k] }}</td>{% endfor %}</tr>
+    {% endfor %}
+  </table>
+  <div style="font-size:12px;color:#6b6b63;margin-bottom:24px;">Last pipeline run: {{ health.last_run or 'never' }}{% if health.last_ok is not none %} ({{ 'ok' if health.last_ok else 'had errors' }}){% endif %} ·
+    agent queue: {{ health.pending }} pending, {{ health.claimed }} in progress, {{ health.failed_period }} failed this period{% if health.stale %}, {{ health.stale }} stale{% endif %}</div>
+
   <table role="presentation" style="width:100%;border-collapse:collapse;background:#fff;border-radius:10px;margin-bottom:24px;font-size:13px;">
     <tr style="color:#6b6b63;text-align:left;">
       <th style="padding:10px;font-weight:500;">Sector</th><th style="padding:10px 6px;font-weight:500;text-align:right;">Found</th>
@@ -105,7 +122,7 @@ TEMPLATE = """<!doctype html>
   {% endif %}
 
   <p style="font-size:12px;color:#8a8a80;line-height:1.5;">Scores rank what to investigate next; they are not investment advice.
-  Every market source above is a page the research agent actually retrieved. Spend this period ${{ spend_period }} ·
+  Every market source above is a page the research agent reported opening, tied to the claim it supports. OpenAlex spend this period ${{ spend_period }} ·
   month to date ${{ spend_month }} of ${{ budget }}.</p>
 </div></body></html>"""
 
@@ -161,6 +178,64 @@ def _opportunity_card(conn, o) -> dict[str, Any]:
     }
 
 
+FUNNEL_KEYS = ["found", "passed_triage", "analysed", "verified_quotes", "ideas", "validated", "scored"]
+FUNNEL_LABELS = ["Found", "Passed triage", "Analysed", "Verified quotes", "Ideas", "Validated", "Scored"]
+
+
+def _health(conn, cfg, since) -> dict[str, Any]:
+    """Failure heartbeat: a silent pipeline should be loud in the digest."""
+    last = conn.execute(
+        "select started_at, finished_at, ok, command from pipeline_runs order by started_at desc limit 1"
+    ).fetchone()
+    errs = conn.execute(
+        "select count(*) n from pipeline_runs where started_at > %s and ok is false", (since,)
+    ).fetchone()["n"]
+    q = conn.execute(
+        """select count(*) filter (where status='pending') pending,
+                  count(*) filter (where status='claimed') claimed,
+                  count(*) filter (where status='claimed' and lease_expires_at < now()) stale,
+                  count(*) filter (where status='failed' and created_at > %s) failed_period,
+                  min(created_at) filter (where status='pending') oldest_pending
+             from agent_tasks""",
+        (since,),
+    ).fetchone()
+    now = datetime.now(timezone.utc)
+    warnings = []
+    if not last:
+        warnings.append("The pipeline has never recorded a run.")
+    else:
+        age_h = (now - last["started_at"]).total_seconds() / 3600
+        if age_h > cfg.heartbeat_max_hours:
+            warnings.append(f"No pipeline run for {age_h:.0f} hours (last: {last['command']} at "
+                            f"{last['started_at']:%Y-%m-%d %H:%M} UTC). Check the GitHub Actions schedule.")
+        if last["ok"] is False:
+            warnings.append(f"The last run ({last['command']}) had errors; see pipeline_runs.results.")
+        if last["finished_at"] is None and age_h > 2:
+            warnings.append("The last run never finished (crashed or timed out).")
+    disc = conn.execute(
+        """select results->'discover' d from pipeline_runs where results ? 'discover'
+            order by started_at desc limit 1"""
+    ).fetchone()
+    if disc and disc["d"]:
+        for p in (disc["d"].get("fatal") or []) + (disc["d"].get("problems") or []):
+            warnings.append(f"Discovery: {p}")
+    if errs:
+        warnings.append(f"{errs} pipeline run(s) with errors this period.")
+    if q["failed_period"]:
+        warnings.append(f"{q['failed_period']} agent task(s) failed after all retries this period.")
+    if q["stale"]:
+        warnings.append(f"{q['stale']} agent task(s) claimed but not submitted before the lease ran out.")
+    if q["oldest_pending"] and (now - q["oldest_pending"]).total_seconds() > cfg.heartbeat_max_hours * 3600:
+        warnings.append(f"Agent tasks have been waiting since {q['oldest_pending']:%Y-%m-%d %H:%M} UTC: "
+                        "are the bots running?")
+    return {
+        "last_run": f"{last['command']} at {last['started_at']:%Y-%m-%d %H:%M} UTC" if last else None,
+        "last_ok": last["ok"] if last else None,
+        "pending": q["pending"], "claimed": q["claimed"], "stale": q["stale"],
+        "failed_period": q["failed_period"], "errored_runs": errs, "warnings": warnings,
+    }
+
+
 def build(conn: psycopg.Connection, cfg) -> dict[str, Any]:
     last = conn.execute("select max(sent_at) as t from digests").fetchone()["t"]
     since = last or datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -191,7 +266,22 @@ def build(conn: psycopg.Connection, cfg) -> dict[str, Any]:
                      and digest_sent_at is null and total_score < %s""",
                 (key, cfg.digest_min_score),
             ).fetchone()["n"]
-        sector_rows.append({"key": key, "kind": sec.kind, "name": sec.label[:1].upper() + sec.label[1:],
+        f = conn.execute(
+            """select
+                 (select count(*) from papers where %(k)s = any(sectors) and discovered_at > %(t)s) as found,
+                 (select count(*) from papers where sector=%(k)s and discovered_at > %(t)s
+                     and status in ('queued','analyzing','analyzed')) as passed_triage,
+                 (select count(*) from papers where sector=%(k)s and analyzed_at > %(t)s) as analysed,
+                 (select count(*) from findings f join papers p on p.id=f.paper_id
+                     where p.sector=%(k)s and f.created_at > %(t)s and f.quote_verified) as verified_quotes,
+                 (select count(*) from opportunities where sector=%(k)s and created_at > %(t)s) as ideas,
+                 (select count(*) from market_validations m join opportunities o on o.id=m.opportunity_id
+                     where o.sector=%(k)s and m.created_at > %(t)s) as validated,
+                 (select count(*) from opportunity_scores s join opportunities o on o.id=s.opportunity_id
+                     where o.sector=%(k)s and s.scored_at > %(t)s) as scored""",
+            {"k": key, "t": since},
+        ).fetchone()
+        sector_rows.append({"key": key, "funnel": dict(f), "kind": sec.kind, "name": sec.label[:1].upper() + sec.label[1:],
                             "leads": leads, "below": below, **counts})
 
     quant_enabled = any(sectors.get(k).kind == "quant" for k in cfg.sectors)
@@ -219,6 +309,7 @@ def build(conn: psycopg.Connection, cfg) -> dict[str, Any]:
             "select coalesce(sum(cost_usd),0) s from agent_runs where started_at >= date_trunc('month', now())"
         ).fetchone()["s"]
     )
+    health = _health(conn, cfg, since)
     changes = conn.execute(
         """select coalesce(o.title, h.hypothesis) as title, r.decision, r.notes from reviews r
              left join opportunities o on o.id = r.opportunity_id
@@ -248,6 +339,9 @@ def build(conn: psycopg.Connection, cfg) -> dict[str, Any]:
             spend_period=f"{spend_period:.2f}",
             spend_month=f"{spend_month:.2f}",
             budget=f"{cfg.monthly_budget_usd:.0f}",
+            health=health,
+            funnel_keys=FUNNEL_KEYS,
+            funnel_labels=FUNNEL_LABELS,
         )
     )
     return {
@@ -257,6 +351,8 @@ def build(conn: psycopg.Connection, cfg) -> dict[str, Any]:
         "today": today,
         "count": total,
         "by_sector": {r["key"]: len(r["leads"]) for r in sector_rows},
+        "funnel": {r["key"]: r["funnel"] for r in sector_rows},
+        "health": health,
     }
 
 
@@ -308,4 +404,5 @@ def run(conn: psycopg.Connection, cfg, send: bool = True) -> dict[str, Any]:
             )
     conn.commit()
     log.info("Digest written to %s (%s opportunities, emailed=%s)", path, d["count"], emailed)
-    return {"path": str(path), "count": d["count"], "by_sector": d["by_sector"], "emailed": emailed}
+    return {"path": str(path), "count": d["count"], "by_sector": d["by_sector"], "emailed": emailed,
+            "funnel": d["funnel"], "health": d["health"]}

@@ -4,11 +4,6 @@ on:
   schedule:
     - cron: "17 3 * * *"   # 05:17 South Africa time, every day (cron is UTC)
   workflow_dispatch:
-    inputs:
-      only:
-        description: "Run only these stages (space separated), e.g. 'discover triage'. Leave empty for all."
-        required: false
-        default: ""
 
 concurrency:
   group: aroi-pipeline
@@ -17,13 +12,13 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       OPENALEX_API_KEY: ${{ secrets.OPENALEX_API_KEY }}
       CONTACT_EMAIL: ${{ secrets.CONTACT_EMAIL }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      MONTHLY_BUDGET_USD: ${{ vars.MONTHLY_BUDGET_USD || '45' }}
+      MONTHLY_BUDGET_USD: ${{ vars.MONTHLY_BUDGET_USD || '30' }}
+      DISCOVERY_DATE_FIELD: ${{ vars.DISCOVERY_DATE_FIELD }}
       SECTORS: ${{ vars.SECTORS }}                      # empty = all five
       ANALYZE_PER_SECTOR: ${{ vars.ANALYZE_PER_SECTOR }}
       VALIDATE_PER_SECTOR: ${{ vars.VALIDATE_PER_SECTOR }}
@@ -35,14 +30,7 @@ jobs:
           cache: pip
       - run: pip install .
       - name: Run pipeline
-        env:
-          ONLY: ${{ github.event.inputs.only }}
-        run: |
-          if [ -n "$ONLY" ]; then
-            python -m aroi daily --only $ONLY
-          else
-            python -m aroi daily
-          fi
+        run: python -m aroi daily   # discover (OpenAlex) + ingest agent results + enqueue agent tasks
       - name: Status
         if: always()
         run: python -m aroi status

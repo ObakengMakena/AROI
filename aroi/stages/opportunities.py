@@ -1,18 +1,21 @@
-"""Stage 4 — Opportunity Generator. Turns verified findings into at most three commercial hypotheses
-per paper, and merges near-duplicate hypotheses from different papers into one opportunity record."""
+"""Stage 4 — Opportunity Generator, done by a Grok Bot agent through the work queue. Turns verified
+findings into at most three commercial hypotheses per paper; ingest merges near-duplicate hypotheses
+from different papers into one opportunity record."""
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Any
 
 import psycopg
 from psycopg.types.json import Jsonb
 
-from .. import prompts, schemas, sectors
-from ..llm import BudgetExceeded
+from .. import agent_queue, prompts, schemas, sectors
 from ..scoring import clamp01
 
 log = logging.getLogger(__name__)
+
+STAGE = "generate"
 
 PUBLIC_TYPES = {"education", "government", "facility", "nonprofit", "healthcare", "archive"}
 
@@ -57,7 +60,7 @@ def _findings_block(findings: list[dict[str, Any]]) -> tuple[str, dict[str, Any]
     return "\n".join(lines), refs
 
 
-def generate_for_paper(conn, cfg, llm, p: dict[str, Any]) -> dict[str, int]:
+def build_task(conn, cfg, p: dict[str, Any]) -> dict[str, Any]:
     analysis = conn.execute(
         "select * from paper_analyses where paper_id=%s order by created_at desc limit 1", (p["id"],)
     ).fetchone()
@@ -70,7 +73,6 @@ def generate_for_paper(conn, cfg, llm, p: dict[str, Any]) -> dict[str, int]:
         (p["id"],),
     ).fetchall()
     findings_text, refs = _findings_block(findings)
-
     user = (
         f"<paper>\nTitle: {p['title']}\nPublished: {p['publication_date']}\n"
         f"Institutions: {', '.join(i['name'] + ' (' + (i['country_code'] or '?') + ')' for i in institutions)}\n"
@@ -82,24 +84,88 @@ def generate_for_paper(conn, cfg, llm, p: dict[str, Any]) -> dict[str, int]:
         f"<analyst_application_ideas>\n{'; '.join(analysis['applications_to_investigate'])}\n</analyst_application_ideas>"
     )
     sector_key = p["sector"] or "agriculture"
-    out = llm.structured(
-        stage=f"opportunities:{sector_key}",
-        model=cfg.analysis_model,
-        system=prompts.render(prompts.OPPORTUNITY_SYSTEM, cfg.country, sector_key),
-        user=user,
-        schema=schemas.OPPORTUNITIES,
-        prompt_version=prompts.OPPORTUNITY_VERSION,
-        max_tokens=5000,
-        paper_id=p["id"],
+    return {
+        "prompt_version": prompts.OPPORTUNITY_VERSION,
+        "instructions": prompts.render(prompts.OPPORTUNITY_SYSTEM, cfg.country, sector_key)
+        + "\n\nReturn at most 3 opportunities. enabling_finding_refs may only use the F refs listed.",
+        "input": user,
+        "output_schema": schemas.OPPORTUNITIES,
+        "refs": {k: str(v) for k, v in refs.items()},
+        "sector": sector_key,
+        "ip_pathway": ip_pathway(institutions, cfg.country, sector_key),
+    }
+
+
+def check(payload: dict[str, Any], result: dict[str, Any]) -> list[str]:
+    errors = []
+    opps = result["opportunities"]
+    if len(opps) > 3:
+        errors.append(f"opportunities: {len(opps)} given, at most 3 allowed")
+    for i, o in enumerate(opps):
+        if not o["title"].strip():
+            errors.append(f"opportunities/{i}/title: empty")
+        bad = [r for r in o["enabling_finding_refs"] if r not in payload["refs"]]
+        if bad:
+            errors.append(f"opportunities/{i}/enabling_finding_refs: unknown refs {bad}; valid: {sorted(payload['refs'])}")
+    return errors
+
+
+def enqueue(conn: psycopg.Connection, cfg, oa=None) -> dict[str, Any]:
+    product_sectors = [k for k in cfg.sectors if sectors.get(k).kind == "product"]
+    papers = conn.execute(
+        """select p.* from papers p
+             join lateral (select evidence_confidence from paper_analyses a where a.paper_id = p.id
+                           order by created_at desc limit 1) a on true
+            where p.status = 'analyzed' and p.opportunities_generated_at is null
+              and a.evidence_confidence >= %s and p.sector = any(%s)
+              and not exists (select 1 from agent_tasks t where t.stage='generate'
+                              and t.subject_key = 'paper:' || p.id and t.status in ('pending','claimed','submitted'))
+            order by (%s = any(p.countries)) desc, a.evidence_confidence desc, p.triage_score desc""",
+        (cfg.min_evidence_for_opportunities, product_sectors, cfg.country.upper()),
+    ).fetchall()
+    # papers below the evidence bar are marked done so they aren't re-checked forever
+    conn.execute(
+        """update papers p set opportunities_generated_at = now()
+            where p.status='analyzed' and p.opportunities_generated_at is null
+              and not exists (select 1 from paper_analyses a where a.paper_id=p.id and a.evidence_confidence >= %s)""",
+        (cfg.min_evidence_for_opportunities,),
     )
+    stats = {"tasks": 0}
+    for p in papers:
+        if agent_queue.enqueue(conn, cfg, STAGE, f"paper:{p['id']}", [p["id"]], build_task(conn, cfg, p),
+                               sector=p["sector"]):
+            stats["tasks"] += 1
+    conn.commit()
+    return stats
+
+
+def ingest(conn, cfg, task) -> dict[str, Any]:
+    p = conn.execute("select * from papers where id=%s", (task["subject_ids"][0],)).fetchone()
+    if p is None:
+        raise ValueError("paper no longer exists")
+    payload, out = task["payload"], task["result"]
+    refs = payload["refs"]
+    sector_key = payload["sector"]
+    pathway = payload["ip_pathway"]
+    r = _store(conn, cfg, p, out, refs, sector_key, pathway)
+    return {"papers": 1, **r}
+
+
+def give_up(conn, task) -> None:
+    conn.execute(
+        """update papers set opportunities_generated_at=now(), metadata = metadata || %s where id = any(%s)""",
+        (Jsonb({"generate_error": task["last_error"]}), task["subject_ids"]),
+    )
+
+
+def _store(conn, cfg, p, out, refs, sector_key, pathway) -> dict[str, int]:
     created = merged = 0
-    pathway = ip_pathway(institutions, cfg.country, sector_key)
     with conn.transaction():
         for o in (out.get("opportunities") or [])[:3]:
             title = (o.get("title") or "").strip()
             if not title:
                 continue
-            finding_ids = [refs[r] for r in o.get("enabling_finding_refs") or [] if r in refs]
+            finding_ids = [uuid.UUID(str(refs[r])) for r in o.get("enabling_finding_refs") or [] if r in refs]
             match = conn.execute(
                 """select id, similarity(title, %(t)s) as sim from opportunities
                     where sector=%(s)s and target_country=%(c)s and similarity(title, %(t)s) >= %(min)s
@@ -150,39 +216,3 @@ def generate_for_paper(conn, cfg, llm, p: dict[str, Any]) -> dict[str, int]:
     return {"created": created, "merged": merged}
 
 
-def run(conn: psycopg.Connection, cfg, llm) -> dict[str, Any]:
-    product_sectors = [k for k in cfg.sectors if sectors.get(k).kind == "product"]
-    papers = conn.execute(
-        """select p.* from papers p
-             join lateral (select evidence_confidence from paper_analyses a where a.paper_id = p.id
-                           order by created_at desc limit 1) a on true
-            where p.status = 'analyzed' and p.opportunities_generated_at is null
-              and a.evidence_confidence >= %s and p.sector = any(%s)
-            order by (%s = any(p.countries)) desc, a.evidence_confidence desc, p.triage_score desc""",
-        (cfg.min_evidence_for_opportunities, product_sectors, cfg.country.upper()),
-    ).fetchall()
-    # papers below the evidence bar are marked done so they aren't re-checked forever
-    conn.execute(
-        """update papers p set opportunities_generated_at = now()
-            where p.status='analyzed' and p.opportunities_generated_at is null
-              and not exists (select 1 from paper_analyses a where a.paper_id=p.id and a.evidence_confidence >= %s)""",
-        (cfg.min_evidence_for_opportunities,),
-    )
-    conn.commit()
-    stats = {"papers": 0, "created": 0, "merged": 0, "failed": 0}
-    for p in papers:
-        try:
-            r = generate_for_paper(conn, cfg, llm, p)
-        except BudgetExceeded:
-            raise
-        except Exception as e:
-            conn.rollback()
-            stats["failed"] += 1
-            log.warning("Opportunity generation failed for %s: %s", p["id"], e)
-            continue
-        conn.commit()
-        stats["papers"] += 1
-        stats["created"] += r["created"]
-        stats["merged"] += r["merged"]
-    log.info("Opportunities: %s", stats)
-    return stats

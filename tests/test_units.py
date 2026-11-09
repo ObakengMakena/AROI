@@ -2,11 +2,12 @@ import pytest
 
 from aroi import prompts, schemas, sectors
 from aroi.cli import rotate_sectors
-from aroi.llm import cost_of
 from aroi.normalize import (
     normalize_doi,
     parse_work,
+    check_quote,
     quote_in_source,
+    verify_quote,
     reconstruct_abstract,
     tei_to_text,
     title_fingerprint,
@@ -73,6 +74,25 @@ def test_quote_in_source():
     assert not quote_in_source("", src)
 
 
+def test_quote_check_min_length_and_negation():
+    src = ("The coating did not reduce corrosion in coastal exposure tests. "
+           "Losses fell from 12.4% to 1.9% over six months of storage in Limpopo.")
+    assert check_quote("fell from 12.4% to 1.9%", src) == (False, "too_short")  # < 30 chars
+    assert check_quote("reduce corrosion in coastal exposure tests", src) == (False, "negated")
+    assert check_quote("Losses fell from 12.4% to 1.9% over six months", src) == (True, "ok")
+    assert check_quote("Losses fell from 12.4% to 0.5% over six months", src) == (False, "not_found")
+    ok, where, why = verify_quote("Losses fell from 12.4% to 1.9% over six months", "abstract only", src)
+    assert (ok, where, why) == (True, "full_text", "ok")
+
+
+def test_confidence_scales_with_verified_ratio():
+    from aroi.stages.analyze import confidence_cap
+    assert confidence_cap(0, 3, True) == pytest.approx(0.3)
+    assert confidence_cap(3, 3, True) == pytest.approx(1.0)
+    assert confidence_cap(3, 3, False) == pytest.approx(0.6)
+    assert confidence_cap(1, 2, True) == pytest.approx(0.65)
+
+
 def test_weighted_score_matches_blueprint():
     assert weighted_score({k: 3 for k in CRITERIA}) == 60.0
     assert weighted_score({k: 5 for k in CRITERIA}) == 100.0
@@ -95,13 +115,6 @@ def test_action_and_grade_guards():
     assert cap_grade("medium", verified_quotes=5, web_sources=9) == "medium"
 
 
-def test_cost_of():
-    assert cost_of("claude-haiku-5-5", 50_000, 0) == pytest.approx(0.005)
-    assert cost_of("claude-haiku-5-5", 200_000, 0) == pytest.approx(0.10)  # long-prompt tier
-    assert cost_of("claude-sonnet-5-5", 0, 1_000_000) == pytest.approx(10.0)
-    assert cost_of("claude-sonnet-5-5", 0, 0, searches=3) == pytest.approx(0.03)
-
-
 def _walk(node, path="$"):
     if isinstance(node, dict):
         yield path, node
@@ -112,15 +125,15 @@ def _walk(node, path="$"):
             yield from _walk(v, f"{path}[{i}]")
 
 
-@pytest.mark.parametrize("name", ["TRIAGE", "ANALYSIS", "FINANCE_ANALYSIS", "OPPORTUNITIES", "VALIDATION", "REVIEW"])
-def test_schemas_fit_structured_output_rules(name):
-    schema = schemas.triage_schema(("a", "b")) if name == "TRIAGE" else getattr(schemas, name)
-    unsupported = {"minimum", "maximum", "minLength", "maxLength", "multipleOf", "maxItems"}
+@pytest.mark.parametrize("name", ["TRIAGE", "ANALYSIS", "FINANCE_ANALYSIS", "OPPORTUNITIES", "VALIDATION", "VALIDATION_SUBMISSION", "REVIEW"])
+def test_schemas_are_strict_and_valid(name):
+    from jsonschema import Draft202012Validator
+    schema = schemas.triage_schema(("a", "b"), ("x", "y")) if name == "TRIAGE" else getattr(schemas, name)
+    Draft202012Validator.check_schema(schema)
     for path, node in _walk(schema):
         if node.get("type") == "object":
             assert node.get("additionalProperties") is False, path
             assert sorted(node["required"]) == sorted(node["properties"]), path
-        assert not (unsupported & set(node)), path
 
 
 def test_testability_score():
@@ -149,3 +162,31 @@ def test_every_sector_renders_every_prompt(key):
     sec = sectors.get(key)
     assert sec.context.get("ZA") and sec.triage_categories and "not_relevant" not in sec.triage_categories
     assert sec.sweep_filter.startswith("primary_topic.")
+
+
+# --- v2: routing queries, SQL stage-check category sync -----------------------------------------
+def test_keyword_filter():
+    from aroi.stages.discover import keyword_filter
+    assert keyword_filter("(momentum OR reversal) AND stock") == "title_and_abstract.search:(momentum OR reversal) AND stock"
+    for bad in ("", "  ", "a, b"):
+        with pytest.raises(ValueError):
+            keyword_filter(bad)
+
+
+def test_seed_queries_are_scoped_and_comma_free():
+    import pathlib, re
+    seed = (pathlib.Path(__file__).parent.parent / "sql" / "seed.sql").read_text()
+    inserts = re.findall(r"\('(\w+)',\s*'((?:[^']|'')*)',\s*'((?:[^']|'')*)',\s*'((?:[^']|'')*)'\)", seed)
+    assert len(inserts) >= 30
+    for sector, theme, query, extra in inserts:
+        assert "," not in query, query
+        assert "primary_topic.subfield.id" in extra, (sector, query)
+
+
+def test_sql_stage_check_categories_match_sectors():
+    import pathlib
+    from aroi import sectors
+    sql = (pathlib.Path(__file__).parent.parent / "sql" / "queue_checks.sql").read_text()
+    for key, s in sectors.SECTORS.items():
+        expect = f"'{key}', jsonb_build_array({', '.join(repr(c) for c in s.triage_categories)})"
+        assert expect in sql, f"sql/queue_checks.sql categories for {key} are out of date"

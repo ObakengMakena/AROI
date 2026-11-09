@@ -160,15 +160,69 @@ def _squash(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
-def quote_in_source(quote: str | None, source: str | None) -> bool:
+_NEGATORS = re.compile(
+    r"\b(not|no|never|neither|nor|without|cannot|failed to|fail to|did not|does not|do not|"
+    r"was not|were not|is not|are not|unable to|lack of|absence of)\b|n't\b"
+)
+
+
+def _find_unnegated(q: str, src: str) -> tuple[bool, bool]:
+    """(found, found_without_negation). A match counts as negated when the 40 characters before it
+    contain a negator that the quote itself does not contain, e.g. quote 'increased the yield' in
+    '...did not show it increased the yield'."""
+    if _NEGATORS.search(q):
+        return (q in src), (q in src)  # the quote carries its own negation; nothing hidden
+    found = False
+    start = 0
+    while True:
+        i = src.find(q, start)
+        if i < 0:
+            return found, False
+        found = True
+        window = src[max(0, i - 40) : i]
+        # only look back to the start of the current sentence
+        window = re.split(r"[.;:!?]\s", window)[-1]
+        if not _NEGATORS.search(window):
+            return True, True
+        start = i + 1
+
+
+def check_quote(quote: str | None, source: str | None, min_chars: int = 30) -> tuple[bool, str]:
+    """Returns (verified, reason). reason is 'ok', 'empty', 'too_short', 'not_found' or 'negated'."""
     if not quote or not source:
-        return False
+        return False, "empty"
     q = _squash(quote).strip(" .…")
-    if len(q) < 12:
-        return False
+    if len(q) < min_chars:
+        return False, "too_short"
     src = _squash(source)
-    if q in src:
-        return True
-    # tolerate an ellipsis joining two exact fragments
-    frags = [f.strip(" .") for f in re.split(r"\.\.\.|…", q) if len(f.strip(" .")) >= 12]
-    return bool(frags) and all(f in src for f in frags)
+    found, clean = _find_unnegated(q, src)
+    if not found:
+        # tolerate an ellipsis joining two exact fragments (each must be substantial)
+        frags = [f.strip(" .") for f in re.split(r"\.\.\.|…", q) if len(f.strip(" .")) >= min(min_chars, 20)]
+        if len(frags) >= 2:
+            results = [_find_unnegated(f, src) for f in frags]
+            if all(r[0] for r in results):
+                return (True, "ok") if all(r[1] for r in results) else (False, "negated")
+        return False, "not_found"
+    return (True, "ok") if clean else (False, "negated")
+
+
+def verify_quote(quote: str | None, abstract: str | None, full_text: str | None,
+                 min_chars: int = 30) -> tuple[bool, str | None, str]:
+    """Check a quote against the abstract, then the full text. Returns (verified, source, reason) where
+    source is 'abstract', 'full_text' or None."""
+    reasons = []
+    for name, text in (("abstract", abstract), ("full_text", full_text)):
+        if not text:
+            continue
+        ok, why = check_quote(quote, text, min_chars)
+        if ok:
+            return True, name, "ok"
+        reasons.append(why)
+    order = ["negated", "not_found", "too_short", "empty"]
+    reason = next((r for r in order if r in reasons), "empty")
+    return False, None, reason
+
+
+def quote_in_source(quote: str | None, source: str | None, min_chars: int = 30) -> bool:
+    return check_quote(quote, source, min_chars)[0]

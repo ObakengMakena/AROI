@@ -6,18 +6,15 @@ import json
 import logging
 import sys
 
-from . import db
+from . import agent_queue, budget, db
+from .budget import BudgetExceeded
 from .config import Config
-from .llm import LLM, BudgetExceeded
+from psycopg.types.json import Jsonb
 
 log = logging.getLogger("aroi")
 
 STAGES = ["discover", "triage", "analyze", "generate", "validate", "score"]
-
-
-def _llm(cfg: Config) -> LLM:
-    cfg.require("anthropic_api_key")
-    return LLM(cfg, db.connect(cfg.database_url))
+AI_STAGES = agent_queue.AI_STAGES
 
 
 def _openalex(cfg: Config):
@@ -27,34 +24,41 @@ def _openalex(cfg: Config):
     return OpenAlexClient(cfg.openalex_api_key, cfg.contact_email)
 
 
-def run_stage(name: str, conn, cfg: Config, llm=None, oa=None) -> dict:
-    from .stages import analyze, discover, opportunities, score, triage, validate
-
+def run_stage(name: str, conn, cfg: Config, oa=None) -> dict:
+    """discover runs directly; for an AI stage this *enqueues* agent tasks (see agent_queue)."""
     if name == "discover":
+        from .stages import discover
+
         return discover.run(conn, cfg, oa)
-    if name == "triage":
-        return triage.run(conn, cfg, llm)
-    if name == "analyze":
-        return analyze.run(conn, cfg, llm, oa)
-    if name == "generate":
-        return opportunities.run(conn, cfg, llm)
-    if name == "validate":
-        return validate.run(conn, cfg, llm)
-    if name == "score":
-        return score.run(conn, cfg, llm)
-    raise ValueError(name)
+    return agent_queue.stage_module(name).enqueue(conn, cfg, oa)
 
 
 def rotate_sectors(keys: list[str], day: int) -> list[str]:
-    """Start with a different sector each day, so if the run budget runs out, the same sector
-    isn't always the one left waiting."""
+    """Start with a different sector each day, so quota-limited stages don't always favour the same one."""
     if not keys:
         return keys
     k = day % len(keys)
     return keys[k:] + keys[:k]
 
 
-def cmd_daily(cfg: Config, only: list[str] | None = None) -> int:
+def _start_run(conn, command: str):
+    row = conn.execute("insert into pipeline_runs (command) values (%s) returning id", (command,)).fetchone()
+    conn.commit()
+    return row["id"]
+
+
+def _finish_run(conn, run_id, ok: bool, results: dict) -> None:
+    conn.rollback()
+    conn.execute(
+        "update pipeline_runs set ok=%s, results=%s, finished_at=now() where id=%s",
+        (ok, Jsonb(json.loads(json.dumps(results, default=str))), run_id),
+    )
+    conn.commit()
+
+
+def run_pipeline(conn, cfg: Config, command: str, steps: list[str], oa=None) -> tuple[bool, dict]:
+    """steps: 'discover', 'ingest', or an AI stage name (= enqueue). Logs a pipeline_runs heartbeat and the
+    OpenAlex spend; a failing step is recorded and later steps still run."""
     from datetime import date
 
     from . import sectors
@@ -62,31 +66,45 @@ def cmd_daily(cfg: Config, only: list[str] | None = None) -> int:
     for key in cfg.sectors:
         sectors.get(key)  # fail fast on a typo in SECTORS
     cfg.sectors = rotate_sectors(cfg.sectors, date.today().toordinal())
-    log.info("Sector order today: %s", ", ".join(cfg.sectors))
-    conn = db.connect(cfg.database_url)
-    needs_llm = any(s != "discover" for s in (only or STAGES))
-    needs_oa = any(s in ("discover", "analyze") for s in (only or STAGES))
-    llm = _llm(cfg) if needs_llm else None
-    oa = _openalex(cfg) if needs_oa else None
-    results, failed = {}, False
-    for stage in only or STAGES:
+    run_id = _start_run(conn, command)
+    results: dict = {"sector_order": cfg.sectors}
+    failed = False
+    cost_before = oa.cost_usd if oa else 0.0
+    for step in steps:
         try:
-            results[stage] = run_stage(stage, conn, cfg, llm, oa)
+            if step in ("discover", "analyze") and oa is not None:
+                budget.check(conn, cfg)  # OpenAlex is the only metered API left
+            if step == "ingest":
+                results["ingest"] = agent_queue.ingest(conn, cfg)
+            else:
+                results[step] = run_stage(step, conn, cfg, oa)
+                if isinstance(results[step], dict) and results[step].get("fatal"):
+                    log.error("Step %s did not do its job: %s", step, results[step]["fatal"])
+                    failed = True
         except BudgetExceeded as e:
-            log.warning("Stopping: %s", e)
-            results[stage] = {"stopped": str(e)}
-            break
+            conn.rollback()
+            log.warning("Skipping %s: %s", step, e)
+            results[step] = {"stopped": str(e)}
         except Exception as e:  # keep going: later stages can still use earlier data
             conn.rollback()
-            log.exception("Stage %s failed", stage)
-            results[stage] = {"error": str(e)[:300]}
+            log.exception("Step %s failed", step)
+            results[step] = {"error": str(e)[:300]}
             failed = True
-    if llm:
-        results["llm_cost_this_run_usd"] = round(llm.run_spend, 4)
     if oa:
-        results["openalex_cost_this_run_usd"] = round(oa.cost_usd, 4)
+        spent = oa.cost_usd - cost_before
+        results["openalex_cost_this_run_usd"] = round(spent, 4)
+        budget.log_openalex(conn, command, spent)
+    results["queue"] = agent_queue.stats(conn)
+    _finish_run(conn, run_id, not failed, results)
+    return not failed, results
+
+
+def cmd_run(cfg: Config, command: str, steps: list[str]) -> int:
+    conn = db.connect(cfg.database_url)
+    oa = _openalex(cfg) if any(s in ("discover", "analyze") for s in steps) else None
+    ok, results = run_pipeline(conn, cfg, command, steps, oa)
     print(json.dumps(results, indent=2, default=str))
-    return 1 if failed else 0
+    return 0 if ok else 1
 
 
 def cmd_review(cfg: Config, item: str, decision: str, notes: str | None) -> int:
@@ -154,8 +172,11 @@ def cmd_status(cfg: Config) -> int:
         print(f"  {r['sector']:14} {r['pipeline_status']}={r['n']}")
     n = conn.execute("select count(*) n from finance_hypotheses").fetchone()["n"]
     print(f"Finance hypotheses: {n}")
+    print("Agent queue")
+    for stage, st in agent_queue.stats(conn).items():
+        print(f"  {stage:14} " + ", ".join(f"{k}={v}" for k, v in st.items()))
     spend = db.month_to_date_spend(conn)
-    print(f"LLM spend this month: ${spend:.2f} of ${cfg.monthly_budget_usd:.2f}")
+    print(f"OpenAlex spend this month: ${spend:.2f} of ${cfg.monthly_budget_usd:.2f}")
     return 0
 
 
@@ -165,10 +186,12 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="aroi", description="African Research Opportunity Intelligence")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("init-db", help="create tables and starter search queries")
-    d = sub.add_parser("daily", help="run the full pipeline (discover → score)")
-    d.add_argument("--only", nargs="+", choices=STAGES, help="run just these stages, in order")
-    for s in STAGES:
-        sub.add_parser(s, help=f"run only the {s} stage")
+    sub.add_parser("daily", help="discover new papers, then tick")
+    sub.add_parser("tick", help="ingest submitted agent results, then enqueue the next agent tasks")
+    sub.add_parser("ingest", help="ingest submitted agent results only")
+    sub.add_parser("discover", help="run only discovery (OpenAlex)")
+    for s in AI_STAGES:
+        sub.add_parser(s, help=f"enqueue {s} tasks for the agents")
     g = sub.add_parser("digest", help="build (and email) the weekly digest")
     g.add_argument("--no-email", action="store_true")
     r = sub.add_parser("review", help="record your decision on an opportunity")
@@ -189,10 +212,15 @@ def main(argv: list[str] | None = None) -> int:
         db.init_db(conn)
         print("Database ready.")
         return 0
+    tick = ["ingest", *AI_STAGES]
     if a.cmd == "daily":
-        return cmd_daily(cfg, a.only)
+        return cmd_run(cfg, "daily", ["discover", *tick])
+    if a.cmd == "tick":
+        return cmd_run(cfg, "tick", tick)
+    if a.cmd == "ingest":
+        return cmd_run(cfg, "ingest", ["ingest"])
     if a.cmd in STAGES:
-        return cmd_daily(cfg, [a.cmd])
+        return cmd_run(cfg, a.cmd, [a.cmd])
     if a.cmd == "digest":
         from . import digest
 

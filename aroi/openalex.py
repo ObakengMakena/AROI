@@ -19,7 +19,7 @@ CONTENT_BASE = "https://content.openalex.org"
 
 SELECT_FIELDS = ",".join(
     [
-        "id", "doi", "title", "display_name", "publication_date", "type", "language",
+        "id", "doi", "title", "display_name", "publication_date", "created_date", "updated_date", "type", "language",
         "primary_location", "open_access", "best_oa_location", "authorships", "primary_topic",
         "keywords", "funders", "cited_by_count", "abstract_inverted_index", "has_content",
     ]
@@ -28,6 +28,17 @@ SELECT_FIELDS = ",".join(
 
 class OpenAlexError(RuntimeError):
     pass
+
+
+class OpenAlexBudgetError(OpenAlexError):
+    """Daily usage allowance exhausted (resets at midnight UTC)."""
+
+
+class OpenAlexPlanError(OpenAlexError):
+    """The request uses a feature the account's plan doesn't include (e.g. created_date filters/sorts)."""
+
+
+_PLAN_WORDS = ("plan upgrade", "daily sync", "member+")
 
 
 class OpenAlexClient:
@@ -45,6 +56,9 @@ class OpenAlexClient:
         self.max_retries = max_retries
         self.use_select = True
         self.cost_usd = 0.0
+        # set by iter_works: meta.count of the last query and whether max_results cut it short
+        self.last_count: int | None = None
+        self.last_truncated = False
         headers = {"User-Agent": f"AROI/1.0 ({contact_email or 'no-contact-set'})"}
         self.http = httpx.Client(timeout=60, headers=headers, transport=transport, follow_redirects=True)
 
@@ -69,10 +83,14 @@ class OpenAlexClient:
                 delay *= 2
                 continue
             if r.status_code == 429:
-                body = r.text[:300]
+                body = r.text[:400]
+                low = body.lower()
+                # OpenAlex also answers 429 for plan-gated features: not a budget problem, never retry
+                if any(w in low for w in _PLAN_WORDS):
+                    raise OpenAlexPlanError(f"OpenAlex feature not in your plan: {body}")
                 # Out of daily budget: retrying won't help until midnight UTC.
-                if any(w in body.lower() for w in ("budget", "daily", "exhausted")):
-                    raise OpenAlexError(f"OpenAlex daily budget exhausted or rate limited: {body}")
+                if any(w in low for w in ("budget", "exhausted")):
+                    raise OpenAlexBudgetError(f"OpenAlex daily budget exhausted: {body}")
                 time.sleep(delay)
                 delay *= 2
                 continue
@@ -105,6 +123,8 @@ class OpenAlexClient:
         if sort:
             params["sort"] = sort
         yielded = 0
+        self.last_count = None
+        self.last_truncated = False
         while True:
             if self.use_select:
                 params["select"] = SELECT_FIELDS
@@ -123,11 +143,20 @@ class OpenAlexClient:
                 raise OpenAlexError(f"OpenAlex {r.status_code}: {r.text[:400]}")
             data = r.json()
             self._track_cost(data)
+            if self.last_count is None:
+                try:
+                    self.last_count = int((data.get("meta") or {}).get("count"))
+                except (TypeError, ValueError):
+                    self.last_count = None
             results = data.get("results") or []
-            for w in results:
+            for i, w in enumerate(results):
                 yield w
                 yielded += 1
                 if yielded >= max_results:
+                    more_here = i < len(results) - 1
+                    more_pages = bool((data.get("meta") or {}).get("next_cursor"))
+                    self.last_truncated = more_here or (self.last_count or 0) > yielded or (
+                        more_pages and self.last_count is None)
                     return
             cursor = (data.get("meta") or {}).get("next_cursor")
             if not cursor or not results:

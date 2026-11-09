@@ -1,5 +1,6 @@
-"""Stage 6 — Investment Committee. A reviewer model challenges the case and returns 1-5 criterion
-scores; the weighted total, evidence-grade cap and recommended action are computed in code."""
+"""Stage 6 — Investment Committee. A Grok Bot reviewer challenges the case (through the work queue) and
+returns 1-5 criterion scores; the weighted total, evidence-grade cap and recommended action are computed
+in code at ingest, from the evidence stored at that moment."""
 from __future__ import annotations
 
 import json
@@ -9,11 +10,12 @@ from typing import Any
 import psycopg
 from psycopg.types.json import Jsonb
 
-from .. import prompts, schemas
-from ..llm import BudgetExceeded
+from .. import agent_queue, prompts, schemas
 from ..scoring import CRITERIA, RUBRIC_VERSION, action_for, cap_grade, weighted_score
 
 log = logging.getLogger(__name__)
+
+STAGE = "score"
 
 
 def build_case(conn, o: dict[str, Any]) -> tuple[str, int, int]:
@@ -49,8 +51,10 @@ def build_case(conn, o: dict[str, Any]) -> tuple[str, int, int]:
         "select memo, structured from market_validations where opportunity_id=%s order by created_at desc limit 1",
         (o["id"],),
     ).fetchone()
+    # only fetched pages tied to a specific claim they support count; the raw citation trail does not
     web_sources = conn.execute(
-        "select count(distinct source_url) as n from evidence_items where opportunity_id=%s and evidence_type='web_citation'",
+        """select count(distinct source_url) as n from evidence_items
+            where opportunity_id=%s and evidence_type <> 'web_citation'""",
         (o["id"],),
     ).fetchone()["n"]
     case = (
@@ -65,18 +69,54 @@ def build_case(conn, o: dict[str, Any]) -> tuple[str, int, int]:
     return case, verified_quotes, web_sources
 
 
-def score_opportunity(conn, cfg, llm, o: dict[str, Any]) -> dict[str, Any]:
-    case, verified_quotes, web_sources = build_case(conn, o)
-    out = llm.structured(
-        stage=f"review:{o['sector']}",
-        model=cfg.review_model,
-        system=prompts.render(prompts.REVIEW_SYSTEM, cfg.country, o["sector"]),
-        user=case,
-        schema=schemas.REVIEW,
-        prompt_version=prompts.REVIEW_VERSION,
-        max_tokens=3500,
-        opportunity_id=o["id"],
+def enqueue(conn: psycopg.Connection, cfg, oa=None) -> dict[str, Any]:
+    opps = conn.execute(
+        """select * from opportunities o where pipeline_status='validated' and stage <> 'rejected'
+              and not exists (select 1 from agent_tasks t where t.stage='score'
+                              and t.subject_key = 'opportunity:' || o.id and t.status in ('pending','claimed','submitted'))
+            order by created_at limit %s""",
+        (cfg.score_per_run,),
+    ).fetchall()
+    stats = {"tasks": 0}
+    for o in opps:
+        case, _, _ = build_case(conn, o)
+        payload = {
+            "prompt_version": prompts.REVIEW_VERSION,
+            "instructions": prompts.render(prompts.REVIEW_SYSTEM, cfg.country, o["sector"]),
+            "input": case,
+            "output_schema": schemas.REVIEW,
+        }
+        if agent_queue.enqueue(conn, cfg, STAGE, f"opportunity:{o['id']}", [o["id"]], payload, sector=o["sector"]):
+            stats["tasks"] += 1
+    conn.commit()
+    return stats
+
+
+def check(payload: dict[str, Any], result: dict[str, Any]) -> list[str]:
+    return []
+
+
+def ingest(conn, cfg, task) -> dict[str, Any]:
+    o = conn.execute("select * from opportunities where id=%s", (task["subject_ids"][0],)).fetchone()
+    if o is None:
+        raise ValueError("opportunity no longer exists")
+    if o["pipeline_status"] != "validated":
+        raise ValueError(f"opportunity is {o['pipeline_status']!r}, expected 'validated'")
+    r = score_opportunity(conn, cfg, o, task["result"], worker=task["claimed_by"] or "grok-bot")
+    log.info("Scored %r: %s", o["title"][:60], r)
+    return {"scored": 1}
+
+
+def give_up(conn, task) -> None:
+    log.warning("Scoring gave up for %s: %s", task["subject_ids"], task["last_error"])
+    conn.execute(
+        "update opportunities set pipeline_status='failed', updated_at=now() where id = any(%s) and pipeline_status='validated'",
+        (task["subject_ids"],),
     )
+
+
+def score_opportunity(conn, cfg, o: dict[str, Any], out: dict[str, Any], worker: str) -> dict[str, Any]:
+    case, verified_quotes, web_sources = build_case(conn, o)
     scores = {k: int(out["criteria"][k]["score"]) for k in CRITERIA}
     total = weighted_score(scores)
     grade = cap_grade(out.get("evidence_grade", "low"), verified_quotes, web_sources)
@@ -96,7 +136,7 @@ def score_opportunity(conn, cfg, llm, o: dict[str, Any]) -> dict[str, Any]:
         conn.execute(
             """insert into opportunity_scores (opportunity_id, rubric_version, criteria_json, total_score,
                  evidence_grade, blocking_risks, model) values (%s,%s,%s,%s,%s,%s,%s)""",
-            (o["id"], RUBRIC_VERSION, Jsonb(criteria_json), total, grade, Jsonb(blockers), cfg.review_model),
+            (o["id"], RUBRIC_VERSION, Jsonb(criteria_json), total, grade, Jsonb(blockers), worker),
         )
         conn.execute(
             """update opportunities set pipeline_status='scored', total_score=%s, evidence_grade=%s,
@@ -106,25 +146,3 @@ def score_opportunity(conn, cfg, llm, o: dict[str, Any]) -> dict[str, Any]:
     return {"score": total, "grade": grade, "action": action}
 
 
-def run(conn: psycopg.Connection, cfg, llm) -> dict[str, Any]:
-    opps = conn.execute(
-        """select * from opportunities where pipeline_status='validated' and stage <> 'rejected'
-            order by created_at limit %s""",
-        (cfg.score_per_run,),
-    ).fetchall()
-    stats = {"scored": 0, "failed": 0}
-    for o in opps:
-        try:
-            r = score_opportunity(conn, cfg, llm, o)
-            log.info("Scored %r: %s", o["title"][:60], r)
-        except BudgetExceeded:
-            raise
-        except Exception as e:
-            conn.rollback()
-            stats["failed"] += 1
-            log.warning("Scoring failed for %s: %s", o["id"], e)
-            continue
-        conn.commit()
-        stats["scored"] += 1
-    log.info("Scoring: %s", stats)
-    return stats

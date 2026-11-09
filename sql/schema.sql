@@ -72,7 +72,7 @@ create table if not exists papers (
   sector text,                                   -- sector whose search found it first
   found_by text[] not null default '{}',        -- 'sweep:<sector>', or the query that found it
   status text not null default 'new'
-    check (status in ('new', 'triaged_out', 'queued', 'analyzing', 'analyzed', 'failed')),
+    check (status in ('new', 'triaging', 'triaged_out', 'queued', 'analyzing', 'analyzed', 'failed')),
   triage_score smallint,
   triage_sector text,
   triage_reason text,
@@ -85,6 +85,12 @@ create table if not exists papers (
 -- upgrades for databases created by v1 (no-ops on a fresh install)
 alter table papers add column if not exists opportunities_generated_at timestamptz;
 alter table papers add column if not exists sector text;
+-- v3: a paper can be found by several sectors; `sector` is the primary (set by triage), `sectors` all candidates
+alter table papers add column if not exists sectors text[] not null default '{}';
+update papers set sectors = array[sector] where sectors = '{}' and sector is not null;
+alter table papers drop constraint if exists papers_status_check;
+alter table papers add constraint papers_status_check
+  check (status in ('new', 'triaging', 'triaged_out', 'queued', 'analyzing', 'analyzed', 'failed'));
 update papers set sector = 'agriculture' where sector is null;
 
 create unique index if not exists papers_title_fp_year_idx
@@ -128,6 +134,8 @@ create table if not exists findings (
   evidence_quote text,
   evidence_location text,
   quote_verified boolean not null default false,   -- quote found verbatim in the source text
+  quote_source text,                               -- 'abstract' | 'full_text' | null (not found)
+  quote_check text,                                -- why a quote failed: too_short | not_found | negated
   measured_or_inferred text check (measured_or_inferred in ('measured', 'inferred')),
   limitations jsonb not null default '[]'::jsonb,
   created_at timestamptz not null default now()
@@ -168,6 +176,9 @@ create table if not exists opportunities (
 );
 create index if not exists opportunities_score_idx on opportunities (total_score desc nulls last);
 create index if not exists opportunities_title_trgm_idx on opportunities using gin (title gin_trgm_ops);
+
+alter table findings add column if not exists quote_source text;
+alter table findings add column if not exists quote_check text;
 
 create table if not exists opportunity_papers (
   opportunity_id uuid not null references opportunities(id) on delete cascade,
@@ -262,7 +273,8 @@ alter table reviews alter column opportunity_id drop not null;
 alter table reviews add column if not exists finance_hypothesis_id uuid references finance_hypotheses(id) on delete cascade;
 
 -- ---------------------------------------------------------------------------
--- Audit + cost log for every LLM call
+-- Audit + cost log. Since v3 the AI stages are done by Grok Bot agents through agent_tasks, so the
+-- only metered spend logged here is OpenAlex (stage 'openalex:<command>').
 -- ---------------------------------------------------------------------------
 create table if not exists agent_runs (
   id uuid primary key default gen_random_uuid(),
@@ -292,6 +304,47 @@ create table if not exists digests (
 );
 alter table digests add column if not exists finance_hypothesis_ids uuid[] not null default '{}';  -- v1 upgrade
 
+-- ---------------------------------------------------------------------------
+-- v3: work queue for the AI stages, done by Grok Bot agents instead of a paid model API.
+-- Code enqueues tasks; a bot pulls (claims) them, submits JSON; code validates and ingests.
+-- ---------------------------------------------------------------------------
+create table if not exists agent_tasks (
+  id uuid primary key default gen_random_uuid(),
+  stage text not null check (stage in ('triage', 'analyze', 'generate', 'validate', 'score')),
+  sector text,
+  subject_key text not null,          -- e.g. 'paper:<uuid>' or 'opportunity:<uuid>' or 'triage:<uuid>,...'
+  subject_ids uuid[] not null default '{}',
+  payload jsonb not null,             -- {instructions, input, output_schema, prompt_version}
+  status text not null default 'pending'
+    check (status in ('pending', 'claimed', 'submitted', 'done', 'failed', 'cancelled')),
+  priority numeric not null default 0,
+  attempts integer not null default 0,
+  max_attempts integer not null default 3,
+  claimed_by text,
+  claimed_at timestamptz,
+  lease_expires_at timestamptz,
+  submitted_at timestamptz,
+  result jsonb,
+  last_error text,
+  error_log jsonb not null default '[]'::jsonb,
+  created_at timestamptz not null default now(),
+  completed_at timestamptz
+);
+create unique index if not exists agent_tasks_active_subject_idx
+  on agent_tasks (stage, subject_key) where status in ('pending', 'claimed', 'submitted');
+create index if not exists agent_tasks_queue_idx on agent_tasks (stage, status, priority desc, created_at);
+
+-- One row per scheduled command: the digest's heartbeat and failure report
+create table if not exists pipeline_runs (
+  id uuid primary key default gen_random_uuid(),
+  command text not null,
+  ok boolean,
+  results jsonb not null default '{}'::jsonb,
+  started_at timestamptz not null default now(),
+  finished_at timestamptz
+);
+create index if not exists pipeline_runs_started_idx on pipeline_runs (started_at desc);
+
 -- Convenience view for the Supabase table editor
 drop view if exists opportunity_board;
 create view opportunity_board with (security_invoker = true) as
@@ -318,7 +371,7 @@ declare t text;
 begin
   foreach t in array array['pipeline_state','institutions','search_queries','papers','paper_institutions',
     'paper_analyses','findings','opportunities','opportunity_papers','market_validations','evidence_items',
-    'opportunity_scores','reviews','agent_runs','digests','finance_hypotheses']
+    'opportunity_scores','reviews','agent_runs','digests','finance_hypotheses','agent_tasks','pipeline_runs']
   loop
     execute format('alter table %I enable row level security', t);
   end loop;

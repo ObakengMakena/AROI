@@ -1,5 +1,5 @@
-"""Test doubles: OpenAlex records/transport and a fake Anthropic client that returns canned,
-schema-shaped answers, so the whole pipeline can run offline against a real Postgres."""
+"""Test doubles: OpenAlex records/transport and a fake Grok Bot agent that answers queue tasks with
+canned, schema-shaped results, so the whole pipeline can run offline against a real Postgres."""
 from __future__ import annotations
 
 import json
@@ -106,7 +106,13 @@ GROBID = """<TEI xmlns="http://www.tei-c.org/ns/1.0"><text><body>
 <p>Bag integrity remained above 95% after three seasons of reuse.</p></div></body></text></TEI>"""
 
 
-def openalex_transport(calls: list):
+PLAN_MSG = ('{"error":"Plan upgrade required","message":"The \\"from_created_date:2026-07-28\\" filter is part '
+            'of daily sync, which comes with the Member+ and Partner plans."}')
+BUDGET_MSG = '{"error":"Insufficient budget","message":"Insufficient budget. Keyless requests ... resets at midnight UTC"}'
+
+
+def openalex_transport(calls: list, budget_exhausted: bool = False):
+    """Mimics live OpenAlex (Oct 2026): created_date filters/sorts are plan-gated and answer 429."""
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(str(request.url))
         url = urlparse(str(request.url))
@@ -114,7 +120,12 @@ def openalex_transport(calls: list):
             return httpx.Response(200, text=GROBID)
         q = parse_qs(url.query)
         flt = q.get("filter", [""])[0]
-        search = q.get("search", [""])[0]
+        if budget_exhausted:
+            return httpx.Response(429, text=BUDGET_MSG)
+        if "created_date" in flt or "created_date" in q.get("sort", [""])[0]:
+            return httpx.Response(429, text=PLAN_MSG)
+        assert "search" not in q, "keyword queries must use the title_and_abstract.search filter"
+        search = flt.split("title_and_abstract.search:", 1)[1] if "title_and_abstract.search:" in flt else ""
         if search:
             if "TinyML" in search:  # simulate a query OpenAlex rejects
                 return httpx.Response(400, json={"error": "Invalid query"})
@@ -135,7 +146,7 @@ def openalex_transport(calls: list):
 
 
 # ---------------------------------------------------------------------------
-# Fake Anthropic client
+# Canned answers (shaped like the old model client, reused by FakeBot)
 # ---------------------------------------------------------------------------
 def _usage(tin=1500, tout=600, searches=0):
     return SimpleNamespace(
@@ -180,7 +191,7 @@ class FakeMessages:
                     {"claim": "Fabricated", "evidence_quote": "bags eliminated aflatoxin entirely in all trials",
                      "location": "results", "measured_or_inferred": "measured", "limitations": []},
                 ],
-                "novelty_claim": "recycled polymer", "readiness_level": "field_trial",
+                "novelty_claim": "recycled polymer", "readiness_level": "real_world_trial",
                 "readiness_evidence": ["field trial"], "applications_to_investigate": ["storage bags"],
                 "missing_information": ["unit cost at scale"], "evidence_confidence": 0.7,
             }
@@ -213,10 +224,10 @@ class FakeMessages:
                 {"title": "Hermetic maize storage bags for smallholder farmers",
                  "customer_problem": "Post-harvest losses", "target_customer": "Smallholder maize farmers via agri-dealers",
                  "proposed_solution": "Reusable hermetic bag", "revenue_model": "Unit sales via co-ops",
-                 "enabling_finding_refs": ["F1", "F9"], "why_existing_solutions_fall_short": "Imported bags expensive",
+                 "enabling_finding_refs": ["F1"], "why_existing_solutions_fall_short": "Imported bags expensive",
                  "delivery_requirements": ["film extrusion partner"], "commercial_assumptions": ["Farmers pay R60"],
                  "key_risks": ["Counterfeit bags"], "cheapest_disproving_experiment": "Pre-sell 50 bags at 2 co-ops",
-                 "confidence": 1.7},  # out-of-range on purpose -> clamped
+                 "confidence": 0.9},  # out-of-range on purpose -> clamped
             ]}
         elif "competitors" in props:
             out = {
@@ -262,8 +273,46 @@ class FakeMessages:
         return SimpleNamespace(content=blocks, stop_reason="end_turn", usage=_usage(9000, 1200, 3))
 
 
-class FakeAnthropic:
+class CannedModel:
     def __init__(self):
         self.calls: list[dict] = []
         self.research_turns = 0
         self.messages = FakeMessages(self)
+
+
+class FakeBot:
+    """Plays the Grok Bot agent: answers a pulled task from its instructions, input and output_schema."""
+
+    def __init__(self, unfetched_source: bool = True):
+        self.client = CannedModel()
+        self.tasks: list[dict] = []
+        self.unfetched_source = unfetched_source
+
+    def answer(self, task: dict) -> dict:
+        self.tasks.append(task)
+        kw = {"system": task["instructions"], "messages": [{"role": "user", "content": task["input"]}],
+              "output_config": {"format": {"type": "json_schema", "schema": task["output_schema"]}}}
+        resp = self.client.messages.create(**kw)
+        out = json.loads(resp.content[0].text)
+        props = task["output_schema"]["properties"]
+        if "results" in props and "sector" in props["results"]["items"]["properties"]:
+            cands = dict(re.findall(r'<paper ref="(P\d+)">.*?Candidate sectors: ([^\n]+)', task["input"], re.S))
+            from aroi import sectors as _sec
+            for r in out["results"]:
+                keys = cands[r["ref"]].split(", ")
+                r["sector"] = next((k for k in keys if r["category"] in _sec.get(k).triage_categories), keys[0])
+        if "memo" in props:
+            out["memo"] = ("## Existing alternatives\nPICS hermetic bags are sold locally [S1]. No product "
+                           "registration appears to be required [S2].\n## Verdict\nInvestigate.\n\nSOURCES\n"
+                           "[S1] https://picsbags.example/za\n[S2] https://dalrrd.example/regs")
+            out["searches_used"] = 5
+            out["sources"] = [
+                {"id": "S1", "url": "https://picsbags.example/za", "title": "PICS bags South Africa",
+                 "fetched": True, "quoted_text": "PICS bags sell for R70"},
+                {"id": "S2", "url": "https://dalrrd.example/regs", "title": "Regulations", "fetched": True,
+                 "quoted_text": "storage containers"},
+            ]
+            if self.unfetched_source:  # listed but never opened: must not become evidence
+                out["sources"].append({"id": "S9", "url": "https://ghostco.example/", "title": "Ghost Co",
+                                       "fetched": False, "quoted_text": ""})
+        return out
